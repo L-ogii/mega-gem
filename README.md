@@ -1,25 +1,29 @@
 # mega-gem
 
-A pure-Python implementation of the **MegaGem** auction-and-collection card
-game, plus a small zoo of bidder AIs, a genetic-algorithm tuner that
-breeds the strongest one, and a FastAPI + WebSocket server that lets you
-play against the AI zoo or other humans from a browser.
+A research playground for the **MegaGem** auction-and-collection card
+game: a pure-Python engine, a zoo of bidder AIs, genetic-algorithm
+tuners that breed stronger ones, and a static web client where you can
+play the current champions in your browser.
 
-The full game rules — turn structure, bid ties, mission categories, value
-charts — live in [`research/RULES.md`](research/RULES.md). This README
+**▶ Play it: <https://lachy-dauth.github.io/mega-gem/>**. The page runs
+the canonical Python engine client-side via
+[Pyodide](https://pyodide.org) and is hosted on GitHub Pages, so there
+is no game server.
+
+The full game rules (turn structure, bid ties, mission categories, value
+charts) live in [`research/RULES.md`](research/RULES.md). This README
 covers everything *around* the rules: how to run the game, what each AI
 does, how to test them, how to evolve a stronger one, and how to read
 the benchmark plots.
 
 > **Repo layout note.** The canonical engine, AI zoo, tests, GA
-> tuners, and checked-in weights live under **`research/`**. The
-> **`server/`** + **`web/`** browser stack lives at the repo root.
-> **Every Python command in this README assumes you are inside
-> `research/` *unless* it explicitly runs the server** — the research
-> scripts resolve paths like `saved_best_weights/` and `artifacts/`
-> relative to the current working directory; the server resolves them
-> via an absolute `Path(__file__)` lookup and can run from the repo
-> root.
+> tuners, and checked-in weights live under **`research/`**. The static
+> browser client lives in **`web/`**. **Every Python command in this
+> README assumes you are inside `research/` unless it says otherwise.**
+> The research scripts resolve paths like `saved_best_weights/` and
+> `artifacts/` relative to the current working directory. The only
+> exception is the site build (`python web/build.py`), which runs from
+> the repo root.
 
 ---
 
@@ -28,7 +32,7 @@ the benchmark plots.
 1. [Quick start](#quick-start)
 2. [Repo layout](#repo-layout)
 3. [Playing in the terminal](#playing-in-the-terminal)
-4. [Playing in the browser (FastAPI server)](#playing-in-the-browser-fastapi-server)
+4. [Playing in the browser (GitHub Pages)](#playing-in-the-browser-github-pages)
 5. [The game engine](#the-game-engine)
 6. [The AI zoo](#the-ai-zoo)
 7. [Testing](#testing)
@@ -54,22 +58,22 @@ source .venv/bin/activate          # or .venv\Scripts\activate on Windows
 #    matplotlib is only required for the GA + heatmap scripts in research/scripts/.
 pip install matplotlib              # only if you want plots
 
-# 4. All Python commands live under research/ — switch there.
+# 4. All Python commands live under research/, so switch there.
 cd research
 
-# 5. Run the test suite (should print "Ran 112 tests ... OK")
+# 5. Run the test suite (should print "Ran 122 tests ... OK")
 python -m unittest discover
 
 # 6. Play a game against three Heuristic AIs in the terminal
 python -m megagem
 
 # 7. Watch four AIs play each other end-to-end on chart E
-python -m megagem --all-ai --ai adaptive --chart E --seed 42
+python -m megagem --all-ai --ai evo4 --chart E --seed 42
 
-# 8. Or play in the browser (from the repo root):
+# 8. Or build and serve the browser client locally (from the repo root):
 cd ..
-pip install -r requirements.txt
-uvicorn server.main:app --reload    # → http://127.0.0.1:8000/
+python web/build.py
+python -m http.server -d _site      # → http://127.0.0.1:8000/
 ```
 
 If everything above worked you have a clean install.
@@ -80,26 +84,21 @@ If everything above worked you have a clean install.
 
 ```
 mega-gem/
-├── server/                  # FastAPI server (imports research/megagem)
-│   ├── main.py                 # App + REST routes + WebSocket endpoint
-│   ├── rooms.py                # Room / Slot / RoomManager
-│   ├── session.py              # GameSession — runs the engine in a thread
-│   ├── remote_player.py        # Player adapter whose decisions come over WS
-│   ├── ai_factory.py           # Mirrors research/megagem/__main__.py's AI_FACTORIES
-│   └── protocol.py             # JSON serialization for engine objects
-├── web/                     # Browser client (served by server/)
-│   ├── index.html              # Menu → lobby / quick play → game → scores
-│   ├── style.css               # Minimal dark theme
-│   └── app.js                  # REST + WebSocket client, DOM rendering
-├── requirements.txt         # Server deps (fastapi, uvicorn, pydantic)
-├── nixpacks.toml            # Railway build config
-├── Procfile                 # Railway start command
-├── railway.json             # Railway service config (healthcheck, restart)
+├── web/                     # Static single-player client (GitHub Pages)
+│   ├── index.html              # Setup → game → scores
+│   ├── bots.html               # Bot descriptions, learned weights, heatmap
+│   ├── app.js                  # UI: renders BrowserSession views, sends bids/reveals
+│   ├── engine-worker.js        # Web Worker: boots Pyodide, unpacks megagem.zip
+│   ├── style.css
+│   ├── heatmap_data.json       # Written by research/scripts/generate_heatmap_json.py
+│   └── build.py                # Assembles _site/ (web files + megagem.zip)
+├── .github/workflows/pages.yml  # Tests on every push/PR; deploys Pages from main
 ├── README.md
 ├── CLAUDE.md                # Cheat-sheet for Claude Code
-└── research/                # Everything Python — run commands from here
+└── research/                # Everything Python. Run commands from here
     ├── megagem/                 # Game engine + AIs (the bit you import)
     │   ├── __main__.py          # Terminal CLI entry point: `python -m megagem`
+    │   ├── browser.py           # Step-wise session driver used by the web client
     │   ├── cards.py             # Gem / Auction / Treasure / Loan / Invest cards
     │   ├── engine.py            # setup_game, play_round, score_game
     │   ├── explain.py           # --debug rationale-printing wrapper
@@ -123,8 +122,11 @@ mega-gem/
     │   │   ├── profiles.py           # Per-AI registry (ai_class, num_weights, mutation σ)
     │   │   ├── opponents.py          # 8-mode opponent providers + shared lookup chain
     │   │   └── ga.py                 # GA loop, evaluation, plot/json output
-    │   └── heatmap_pairwise.py        # All-vs-all win-rate matrix plot
-    ├── tests/                   # unittest suite (112 tests, stdlib only)
+    │   ├── cycle_evolve.py           # Round-robin retraining of every evo profile
+    │   ├── generate_heatmap_json.py  # Heatmap data for web/bots.html
+    │   └── heatmap_pairwise.py       # All-vs-all win-rate matrix plot
+    ├── tests/                   # unittest suite (122 tests, stdlib only)
+    │   ├── test_browser.py      # Web session driver: replay determinism, phases
     │   ├── test_cards.py
     │   ├── test_engine.py
     │   ├── test_heuristic.py    # Big file — covers every AI's helper math
@@ -133,19 +135,20 @@ mega-gem/
     │   ├── test_evo4.py         # Evo4AI-specific helpers + head-to-head
     │   ├── test_missions.py
     │   └── test_scoring.py
-    ├── saved_best_weights/      # Checked-in GA outputs — the CLI reads these
-    │   ├── best_weights_evo1_vs_heuristic_4p.json  # HyperAdaptiveSplitAI
-    │   ├── best_weights_evo2_vs_evo1_4p.json       # Evo2AI
-    │   └── best_weights_evo3_vs_all_4p.json        # Evo3AI
+    ├── saved_best_weights/      # Checked-in GA outputs — the CLI + site read these
+    │   ├── best_weights_evo1_vs_all_4p.json   # HyperAdaptiveSplitAI
+    │   ├── best_weights_evo2_vs_all_4p.json   # Evo2AI
+    │   ├── best_weights_evo3_vs_all_4p.json   # Evo3AI
+    │   └── best_weights_evo4_vs_all_4p.json   # Evo4AI
     ├── artifacts/               # Transient GA output (gitignored)
     └── RULES.md                 # The actual game rules — read this first
 ```
 
-The Python CLI, engine, and tests have **zero** third-party dependencies
-— stdlib only. matplotlib is needed only for the GA + heatmap scripts in
-`research/scripts/`. The server in `server/` depends on FastAPI + uvicorn
-+ pydantic (see `requirements.txt`). The browser client in `web/` has no
-dependencies (vanilla JS).
+Everything in `research/` (engine, CLI, tests) has **zero** third-party
+dependencies; it is stdlib only. matplotlib is needed only for the GA +
+heatmap scripts in `research/scripts/`. The browser client in `web/` is
+vanilla JS and loads Pyodide from a CDN at runtime; `web/build.py` is
+stdlib only.
 
 ---
 
@@ -205,140 +208,81 @@ deductions, and grand totals.
 
 ---
 
-## Playing in the browser (FastAPI server)
+## Playing in the browser (GitHub Pages)
 
-The `server/` directory is a FastAPI + WebSocket app that hosts all
-browser-based play. It reuses the canonical Python engine and AI zoo
-directly (`server/__init__.py` prepends `research/` to `sys.path`), so
-any AI you add under `research/megagem/players/` is immediately
-available as an opponent.
+The live site is <https://lachy-dauth.github.io/mega-gem/>. It is a
+single-player client: you against 2–4 bots of your choice (any of
+Random, Heuristic, Evo1–Evo4), or a **Watch bots** spectator mode where
+every hand is face-up and you can step or auto-play through a bot-only
+game. Turn on *Show bot reasoning* to see each AI's `explain_bid` output
+(features, head outputs, opponent-delta history) in the round log, the
+same lines the CLI's `--debug` prints. Every game shows its seed; enter
+it on the setup screen (or hit *Rematch*) to replay the same deal.
 
-### Run it locally
+### How it works
+
+There is no game server and no JS port of the rules. The browser runs
+the **canonical `research/megagem` package** inside
+[Pyodide](https://pyodide.org) (CPython compiled to WebAssembly):
+
+```
+index.html + app.js ──postMessage──▶ engine-worker.js (Web Worker)
+   (renders views,                      ├─ loadPyodide()  ← cdn.jsdelivr.net/npm/pyodide
+    sends bids/reveals)                  ├─ unpack megagem.zip
+                                         │    megagem/**.py + saved_best_weights/*.json
+                                         └─ megagem.browser.BrowserSession
+                                               ↓
+                                            engine.play_round()  ← unchanged
+```
+
+`megagem/browser.py` is a frontend adapter, like the CLI in
+`__main__.py`. The engine is synchronous and calls
+`choose_bid` / `choose_gem_to_reveal` inline, but a page can't block
+waiting for a click:
+
+- **Bids** are simultaneous, so the human's bid is collected *before*
+  `play_round` runs and preloaded on the human seat.
+- **Reveals** happen mid-round, and only if the human wins. The session
+  deep-copies `(state, rng)` before each round. If the human's reveal is
+  needed, the seat raises `_NeedReveal`, the page asks which gem to
+  reveal, and the round is **replayed from the snapshot** with the answer
+  preloaded. Every AI and the tie-break RNG live inside the snapshot, so
+  the replay is the same round. `tests/test_browser.py` checks that a
+  browser game produces exactly the bids and scores of the same game
+  played straight through the engine.
+- **Bot reasoning** is computed on a throwaway deep copy, so turning it
+  on cannot change a game.
+
+Weights come from `saved_best_weights/` via the same lookup chain as the
+CLI. If no file matches the seat count, the site falls back to the 4p
+weights (every checked-in file is 4p), then to class defaults.
+
+### Build and run locally
 
 ```bash
-# From the repo root — NOT from inside research/.
-pip install -r requirements.txt
-uvicorn server.main:app --reload
-# → open http://127.0.0.1:8000/
+# From the repo root.
+python web/build.py                 # → _site/ (web files + megagem.zip)
+python -m http.server -d _site      # → http://127.0.0.1:8000/
 ```
 
-The menu offers three ways to play:
+`build.py` copies `web/*.{html,css,js,svg,json}`, zips
+`research/megagem/**/*.py` plus `research/saved_best_weights/*.json` into
+`_site/megagem.zip`, and stamps a content hash into the asset URLs so
+browsers pick up new engines and weights. Rebuild after changing
+anything under `research/megagem/` or promoting new weights.
 
-- **Quick play** — pick your name, player count, AI difficulty, chart,
-  and optional seed. Hits `POST /api/rooms/quick_play` which creates a
-  room pre-filled with bots and starts the game immediately. No lobby
-  step.
-- **Create room** — creates a multiplayer lobby with a 5-character share
-  code. The host can add AI seats, invite friends, configure the chart /
-  seed, and start when ready.
-- **Join existing** — enter a friend's room code to claim a seat.
+The first page load downloads the Pyodide runtime (~10 MB, then cached).
+To work offline, point the worker at a local copy of the
+[`pyodide` npm package](https://www.npmjs.com/package/pyodide):
+`npm pack pyodide@0.29.5`, unpack it into `_site/pyodide/`, and open
+`http://127.0.0.1:8000/?pyodide=/pyodide/`.
 
-### Architecture
+### Deployment
 
-```
-Browser ──HTTP──▶  /api/rooms (create/join/add_ai/start)
-         ──WS────▶  /api/ws/{code}?player_id=...
-                         │
-                         ▼
-                 ┌─────────────────┐
-                 │  server.main    │  FastAPI app (async)
-                 │  ├─ rooms.py    │  in-memory RoomManager
-                 │  ├─ session.py  │  one background thread per room
-                 │  │    ↓         │
-                 │  │  engine.play_round() ← synchronous
-                 │  │    ↑         │
-                 │  └─ remote_player.py  ← queue.Queue blocks the
-                 │                         game thread until a human
-                 │                         WS message arrives
-                 └─────────────────┘
-```
-
-The single most important design decision: the canonical engine is
-**synchronous** (`play_round` iterates players and calls
-`player.choose_bid` inline), so the multiplayer server drives it in a
-background `threading.Thread` per room and bridges the two worlds with
-thread-safe queues:
-
-- **WS → game thread**: a `queue.Queue` on each `RemotePlayer`.
-  `choose_bid` blocks on `queue.get()`; the async WS handler does
-  `queue.put(amount)` when a `{"type": "bid"}` message arrives.
-- **Game thread → WS**: `asyncio.run_coroutine_threadsafe(room.broadcast(...), loop)`
-  schedules the outbound broadcast on the main event loop.
-
-The session also tracks "pending requests" per seat so a mid-game page
-refresh re-receives the last `request_bid` / `request_reveal` on WS
-reconnect — otherwise a reload would leave the player staring at a
-frozen board while the game thread is still blocked on their queue.
-
-### Protocol
-
-Every WS message is JSON with a `"type"` field:
-
-| Direction | Type | Meaning |
-|-----------|------|---------|
-| S → C | `welcome` | Initial snapshot with your seat index. |
-| S → C | `lobby_update` | Room composition changed. |
-| S → C | `game_start` | Game kicked off. |
-| S → C | `state` | Personalised state snapshot (your own hand is revealed; opponents are hidden-hand). |
-| S → C | `round_start` | New auction card on offer. |
-| S → C | `request_bid` | It's your turn to bid. Includes `max_bid` and the current auction. |
-| S → C | `request_reveal` | You won the round — pick a gem from your hand to reveal. |
-| S → C | `round_end` | Bids, winner, taken gems, completed missions. |
-| S → C | `game_end` | Final scores. |
-| S → C | `chat` | Player chat (broadcast). |
-| S → C | `error` | Something went wrong. |
-| C → S | `bid` | `{amount: int}` — bid in response to `request_bid`. |
-| C → S | `reveal` | `{color: "Blue" \| …}` — gem to reveal from your hand. |
-| C → S | `chat` | `{text: str}` |
-| C → S | `ping` | Heartbeat (server replies `pong`). |
-
-### REST routes
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET`  | `/api/health` | Liveness probe — also used by Railway. |
-| `GET`  | `/api/config` | Min/max players, valid charts, AI kinds. |
-| `POST` | `/api/rooms` | Create a room; returns `{room, you}`. |
-| `POST` | `/api/rooms/quick_play` | Create a room pre-filled with AI bots and start immediately. |
-| `GET`  | `/api/rooms/{code}` | Fetch current lobby state. |
-| `POST` | `/api/rooms/{code}/join` | Claim a human seat. |
-| `POST` | `/api/rooms/{code}/add_ai` | (host) Add an AI seat with a given kind. |
-| `POST` | `/api/rooms/{code}/configure` | (host) Change chart / seed in lobby. |
-| `POST` | `/api/rooms/{code}/remove_slot` | (host) Kick a seat. |
-| `POST` | `/api/rooms/{code}/start` | (host) Spin up the `GameSession` thread. |
-
-### Deploying to Railway
-
-The repo ships with both `nixpacks.toml` and a `Procfile`, so Railway's
-Nixpacks builder will pick it up without any manual config:
-
-1. Push this repo to GitHub.
-2. Create a new Railway project → **Deploy from GitHub** → pick the repo.
-3. Railway reads `requirements.txt`, runs `pip install`, and starts
-   `uvicorn server.main:app --host 0.0.0.0 --port $PORT`.
-4. The healthcheck at `/api/health` (configured in `railway.json`)
-   gates the deploy.
-
-Active room state is in-memory only — a redeploy wipes in-flight
-rooms. That's fine for the MVP; swap in Redis or Postgres for
-persistent rooms when it matters.
-
-### Limitations / next steps
-
-- **No auth.** Players enter a display name and get a random
-  `player_id` back. Anyone with the `player_id` can act as that seat.
-  Good enough for playing with friends over a shared link; not good
-  enough for ranked matches.
-- **Rooms are not persisted.** An in-memory `RoomManager`. A Railway
-  restart drops every active game. Fine for now; swap in Redis when it
-  matters. (The game record DB *is* persisted — see above.)
-- **Single-process.** One uvicorn worker. Scaling horizontally requires
-  moving room state out of process memory first.
-- **No spectators.** A WS connection is tied to a seat. Adding
-  `spectator` connections that just receive state snapshots is a small
-  follow-up.
-- **Frontend is intentionally minimal.** The UI in `web/` is functional
-  but plain. Improvements to the board rendering are a welcome follow-up.
+`.github/workflows/pages.yml` runs the unit tests and a headless CLI
+smoke test on every push and PR, builds `_site/`, and deploys it to
+GitHub Pages on pushes to `main`. One-time setup: **Settings → Pages →
+Build and deployment → Source: GitHub Actions**.
 
 ---
 
@@ -584,7 +528,7 @@ new weights.
 ## Testing
 
 ```bash
-# Whole suite (currently 112 tests, ~1s).
+# Whole suite (currently 122 tests, ~1s).
 python -m unittest discover
 
 # Just the AI / heuristic tests (the biggest file).

@@ -1,801 +1,763 @@
-// MegaGem multiplayer client.
+// MegaGem static client.
 //
-// Thin SPA: REST to create/join rooms, WebSocket for realtime game
-// events. No framework — just vanilla DOM manipulation grouped into
-// a few small modules.
+// All game logic runs in engine-worker.js (Pyodide + the canonical
+// research/megagem package). This file only renders the views that
+// megagem.browser.BrowserSession returns and sends back bids/reveals.
 
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
+const COLORS = ["Blue", "Green", "Pink", "Purple", "Yellow"];
+const COLOR_HEX = { Blue: "#4f9bff", Green: "#33d68b", Pink: "#ff5fae", Purple: "#a875ff", Yellow: "#ffcc3d" };
+const TOTAL_AUCTIONS = 25;
 
-const state = {
-    // Identity (persisted in sessionStorage so a page reload keeps your seat)
-    playerId: null,
-    slotIndex: null,
-    roomCode: null,
-    isHost: false,
-    // Lobby / game data
-    room: null,
-    gameState: null,
-    currentAuction: null,
-    currentMaxBid: null,
-    waitingOnBid: false,
-    waitingOnReveal: false,
-    // WebSocket + reconnection
-    ws: null,
-    wsClosedByUser: false,
-    reconnectAttempts: 0,
-    reconnectTimer: null,
-    // Chat history (kept across lobby → game → reconnects)
-    chatMessages: [],
+const CHARTS = {
+  A: { values: [0, 4, 8, 12, 16, 20], label: "Rising" },
+  B: { values: [20, 16, 12, 8, 4, 0], label: "Falling" },
+  C: { values: [0, 2, 5, 9, 14, 20], label: "Slow climb" },
+  D: { values: [20, 18, 15, 11, 6, 0], label: "Slow fall" },
+  E: { values: [0, 4, 10, 18, 6, 0], label: "Peaks at 3" },
 };
 
-// Max exponential backoff cap, in ms.
-const RECONNECT_MAX_DELAY_MS = 16000;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// Strongest first. Keys match megagem.browser.AI_FACTORIES.
+const BOTS = [
+  { kind: "evo4", label: "Evo4", tier: "Champion" },
+  { kind: "evo3", label: "Evo3", tier: "Very hard" },
+  { kind: "evo2", label: "Evo2", tier: "Hard" },
+  { kind: "evolved", label: "Evo1", tier: "Tough" },
+  { kind: "heuristic", label: "Heuristic", tier: "Medium" },
+  { kind: "random", label: "Random", tier: "Very easy" },
+];
+const BOT_BY_KIND = Object.fromEntries(BOTS.map((b) => [b.kind, b]));
+const BOT_NAMES = ["Ruby", "Onyx", "Jade", "Opal", "Topaz", "Garnet"];
 
 const $ = (id) => document.getElementById(id);
-const el = (tag, cls, text) => {
-    const e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text !== undefined) e.textContent = text;
-    return e;
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// --------------------------------------------------------------------------
+// Gem art: one cut per colour so colours stay distinguishable without hue.
+// --------------------------------------------------------------------------
+
+const ngon = (n, r, rot = -Math.PI / 2, cx = 16, cy = 16) =>
+  Array.from({ length: n }, (_, i) => [cx + r * Math.cos(rot + (2 * Math.PI * i) / n), cy + r * Math.sin(rot + (2 * Math.PI * i) / n)]);
+
+const GEM_SHAPES = {
+  Blue: ngon(5, 14.5),
+  Green: [[10, 3], [22, 3], [28, 9], [28, 23], [22, 29], [10, 29], [4, 23], [4, 9]],
+  Pink: ngon(10, 14, -Math.PI / 2 + Math.PI / 10),
+  Purple: ngon(6, 14.5),
+  Yellow: [[16, 3], [29.5, 27], [2.5, 27]],
 };
 
-// Mission category SVG icons (use currentColor so CSS controls hue)
-const MISSION_ICONS = {
-    pendant: `<svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M7 2Q10 0 13 2"/><polygon points="10,18 4,8 8,5 12,5 16,8"/><line x1="4" y1="8" x2="16" y2="8"/><line x1="8" y1="5" x2="10" y2="18"/><line x1="12" y1="5" x2="10" y2="18"/></svg>`,
-    crown: `<svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M3 15L3 7L7 10L10 4L13 10L17 7L17 15Z"/><line x1="3" y1="17" x2="17" y2="17"/></svg>`,
-    shield: `<svg viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M10 18Q4 14 3 8L3 3L10 5L17 3L17 8Q16 14 10 18Z"/><path d="M10 5L10 14" opacity="0.5"/></svg>`,
-};
-
-function missionDescription(name) {
-    const idx = name.indexOf(": ");
-    return idx >= 0 ? name.slice(idx + 2) : name;
+const gemCache = {};
+function gem(color, size = "") {
+  const key = color + size;
+  if (gemCache[key]) return gemCache[key];
+  const pts = GEM_SHAPES[color];
+  const hex = COLOR_HEX[color];
+  const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+  const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+  const inner = pts.map(([x, y]) => [cx + (x - cx) * 0.5, cy + (y - cy) * 0.5]);
+  const f = (arr) => arr.map((p) => p.map((v) => v.toFixed(2)).join(",")).join(" ");
+  let facets = "";
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    // Light from the top-left: shade each crown facet by how much its
+    // outward direction (centre → edge midpoint) faces the light.
+    const nx = (a[0] + b[0]) / 2 - cx, ny = (a[1] + b[1]) / 2 - cy;
+    const light = (nx * -0.6 + ny * -0.8) / (Math.hypot(nx, ny) || 1);
+    const fill = light > 0 ? "#fff" : "#000";
+    const op = Math.min(0.42, Math.abs(light) * 0.4).toFixed(2);
+    facets += `<polygon points="${f([a, b, inner[(i + 1) % pts.length], inner[i]])}" fill="${fill}" opacity="${op}"/>`;
+  }
+  const svg =
+    `<svg class="gem ${size}" viewBox="0 0 32 32" role="img" aria-label="${color}"><title>${color}</title>` +
+    `<polygon points="${f(pts)}" fill="${hex}"/>${facets}` +
+    `<polygon points="${f(inner)}" fill="#fff" opacity="0.18"/>` +
+    `<polygon points="${f(pts)}" fill="none" stroke="#fff" stroke-opacity="0.45" stroke-width="0.8" stroke-linejoin="round"/></svg>`;
+  return (gemCache[key] = svg);
 }
 
-function showScreen(id) {
-    for (const s of document.querySelectorAll(".screen")) {
-        s.hidden = s.id !== id;
-    }
-    // Leave button only shows when you're actually in a room flow.
-    const inRoom = id === "screen-lobby" || id === "screen-game" || id === "screen-end";
-    $("leave").hidden = !inRoom;
-    // Chat is visible whenever the player is in a room (lobby + game).
-    // The end screen also shows it so post-game trash talk still works.
-    $("chat-panel").hidden = !inRoom;
-    // Only show the connection pill while there's an active WS.
-    $("conn-status").hidden = !inRoom;
+const coin = (n) => `<span class="coin">${n}</span>`;
 
-    // On game screen, move chat into the 3-column game layout;
-    // on other screens, move it back to <main> so it appears below content.
-    const chatPanel = $("chat-panel");
-    const gameLayout = document.querySelector(".game-layout");
-    if (id === "screen-game" && gameLayout) {
-        gameLayout.appendChild(chatPanel);
-    } else if (chatPanel.parentElement !== $("app")) {
-        $("app").appendChild(chatPanel);
-    }
-    // Toggle wider max-width on <main> for the 3-column desktop layout.
-    $("app").classList.toggle("game-active", id === "screen-game");
+function gemCounts(counts, size = "sm") {
+  const parts = COLORS.filter((c) => counts[c] > 0).map((c) =>
+    counts[c] > 1 ? `<span class="gem-stack">${gem(c, size)}×${counts[c]}</span>` : gem(c, size));
+  return parts.length ? parts.join("") : '<span class="empty">none</span>';
 }
 
-function toast(message, kind = "info") {
-    const t = $("toast");
-    t.textContent = message;
-    t.className = "toast" + (kind === "error" ? " error" : "");
-    t.hidden = false;
-    setTimeout(() => (t.hidden = true), kind === "error" ? 5000 : 2500);
+function gemList(colors, size = "") {
+  return colors.length ? colors.map((c) => gem(c, size)).join("") : '<span class="empty">none</span>';
 }
 
-async function api(method, path, body) {
-    const opts = { method, headers: {} };
-    if (body !== undefined) {
-        opts.headers["Content-Type"] = "application/json";
-        opts.body = JSON.stringify(body);
-    }
-    const res = await fetch(path, opts);
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-        const msg = data.detail || `${method} ${path} failed`;
-        throw new Error(msg);
-    }
-    return data;
-}
+const countColors = (colors) => colors.reduce((m, c) => ((m[c] = (m[c] || 0) + 1), m), {});
 
-function saveSession() {
-    sessionStorage.setItem(
-        "megagem.session",
-        JSON.stringify({
-            playerId: state.playerId,
-            roomCode: state.roomCode,
-            slotIndex: state.slotIndex,
-            isHost: state.isHost,
-        }),
-    );
-}
+// --------------------------------------------------------------------------
+// Engine worker wrapper
+// --------------------------------------------------------------------------
 
-function clearSession() {
-    sessionStorage.removeItem("megagem.session");
-    state.playerId = null;
-    state.slotIndex = null;
-    state.roomCode = null;
-    state.isHost = false;
-    state.room = null;
-    state.gameState = null;
-    state.currentAuction = null;
-    state.chatMessages = [];
-    renderChat();
-    if (state.reconnectTimer) {
-        clearTimeout(state.reconnectTimer);
-        state.reconnectTimer = null;
-    }
-    state.reconnectAttempts = 0;
-    setConnStatus("offline", "offline");
-}
-
-function restoreSession() {
-    try {
-        const raw = sessionStorage.getItem("megagem.session");
-        if (!raw) return false;
-        const data = JSON.parse(raw);
-        if (!data.playerId || !data.roomCode) return false;
-        state.playerId = data.playerId;
-        state.roomCode = data.roomCode;
-        state.slotIndex = data.slotIndex ?? null;
-        state.isHost = !!data.isHost;
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Menu screen
-// ---------------------------------------------------------------------------
-
-async function onQuickPlay() {
-    const name = $("menu-name-quick").value.trim();
-    if (!name) return toast("Enter your name first", "error");
-    const numPlayers = Number($("menu-num-players").value);
-    const aiKind = $("menu-ai-kind").value;
-    const chart = $("menu-chart-quick").value;
-    const seedRaw = $("menu-seed-quick").value;
-    const seed = seedRaw === "" ? null : Number(seedRaw);
-    try {
-        const data = await api("POST", "/api/rooms/quick_play", {
-            host_name: name,
-            num_players: numPlayers,
-            ai_kind: aiKind,
-            chart,
-            seed,
-        });
-        state.room = data.room;
-        state.roomCode = data.room.code;
-        state.playerId = data.you.player_id;
-        state.slotIndex = data.you.slot_index;
-        state.isHost = data.you.is_host;
-        saveSession();
-        $("g-log").innerHTML = "";
-        showScreen("screen-game");
-        connectWebSocket();
-    } catch (e) {
-        toast(e.message, "error");
-    }
-}
-
-async function onCreateRoom() {
-    const name = $("menu-name").value.trim();
-    if (!name) return toast("Enter your name first", "error");
-    const chart = $("menu-chart").value;
-    const seedRaw = $("menu-seed").value;
-    const seed = seedRaw === "" ? null : Number(seedRaw);
-    try {
-        const data = await api("POST", "/api/rooms", {
-            host_name: name,
-            chart,
-            seed,
-        });
-        applyJoinResponse(data);
-    } catch (e) {
-        toast(e.message, "error");
-    }
-}
-
-async function onJoinRoom() {
-    const name = $("menu-name-join").value.trim();
-    const code = $("menu-code").value.trim().toUpperCase();
-    if (!name) return toast("Enter your name first", "error");
-    if (!code) return toast("Enter a room code", "error");
-    try {
-        const data = await api("POST", `/api/rooms/${code}/join`, { name });
-        applyJoinResponse(data);
-    } catch (e) {
-        toast(e.message, "error");
-    }
-}
-
-function applyJoinResponse(data) {
-    state.room = data.room;
-    state.roomCode = data.room.code;
-    state.playerId = data.you.player_id;
-    state.slotIndex = data.you.slot_index;
-    state.isHost = data.you.is_host;
-    saveSession();
-    renderLobby();
-    showScreen("screen-lobby");
-    connectWebSocket();
-}
-
-// ---------------------------------------------------------------------------
-// Lobby screen
-// ---------------------------------------------------------------------------
-
-function renderLobby() {
-    if (!state.room) return;
-    $("lobby-code").textContent = state.room.code;
-    $("lobby-count").textContent = state.room.slots.length;
-
-    const chartSel = $("lobby-chart");
-    chartSel.value = state.room.chart;
-    chartSel.disabled = !state.isHost;
-
-    const seedInput = $("lobby-seed");
-    seedInput.value = state.room.seed ?? "";
-    seedInput.disabled = !state.isHost;
-
-    const list = $("lobby-slots");
-    list.innerHTML = "";
-    for (const slot of state.room.slots) {
-        const li = el("li");
-        const left = el("div");
-        left.appendChild(el("span", "slot-name", slot.name));
-        const tag = el("span", "slot-tag " + slot.kind, slot.kind === "ai" ? `AI: ${slot.ai_kind}` : "human");
-        left.appendChild(tag);
-        if (slot.index === state.room.host_slot_index) {
-            left.appendChild(el("span", "slot-tag host", "host"));
-        }
-        li.appendChild(left);
-        if (state.isHost && slot.index !== state.room.host_slot_index) {
-            const btn = el("button", "ghost", "Kick");
-            btn.onclick = () => onKickSlot(slot);
-            li.appendChild(btn);
-        }
-        list.appendChild(li);
-    }
-
-    $("host-controls").hidden = !state.isHost;
-    const canStart = state.isHost && state.room.slots.length >= state.room.min_players;
-    $("lobby-start").hidden = !state.isHost;
-    $("lobby-start").disabled = !canStart;
-    $("lobby-status").textContent = state.isHost
-        ? canStart
-            ? "Ready when you are."
-            : `Need ${state.room.min_players - state.room.slots.length} more player(s) or AI seat(s).`
-        : "Waiting for the host to start the game.";
-}
-
-async function onAddAI() {
-    const kind = $("lobby-ai-kind").value;
-    try {
-        await api("POST", `/api/rooms/${state.roomCode}/add_ai`, {
-            player_id: state.playerId,
-            ai_kind: kind,
-        });
-    } catch (e) {
-        toast(e.message, "error");
-    }
-}
-
-async function onKickSlot(slot) {
-    try {
-        await api("POST", `/api/rooms/${state.roomCode}/remove_slot`, {
-            player_id: state.playerId,
-            target_slot_index: slot.index,
-        });
-    } catch (e) {
-        toast(e.message, "error");
-    }
-}
-
-async function onConfigureChart(value) {
-    try {
-        await api("POST", `/api/rooms/${state.roomCode}/configure`, {
-            player_id: state.playerId,
-            chart: value,
-        });
-    } catch (e) {
-        toast(e.message, "error");
-    }
-}
-
-async function onConfigureSeed(value) {
-    const seed = value === "" ? null : Number(value);
-    try {
-        await api("POST", `/api/rooms/${state.roomCode}/configure`, {
-            player_id: state.playerId,
-            seed,
-        });
-    } catch (e) {
-        toast(e.message, "error");
-    }
-}
-
-async function onStartGame() {
-    try {
-        await api("POST", `/api/rooms/${state.roomCode}/start`, {
-            player_id: state.playerId,
-        });
-    } catch (e) {
-        toast(e.message, "error");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WebSocket
-// ---------------------------------------------------------------------------
-
-function connectWebSocket() {
-    if (!state.roomCode || !state.playerId) return;
-    if (state.reconnectTimer) {
-        clearTimeout(state.reconnectTimer);
-        state.reconnectTimer = null;
-    }
-    if (state.ws) {
-        try { state.ws.close(); } catch {}
-    }
-    state.wsClosedByUser = false;
-
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${proto}//${location.host}/api/ws/${state.roomCode}?player_id=${encodeURIComponent(state.playerId)}`;
-    setConnStatus(
-        state.reconnectAttempts > 0 ? "reconnecting" : "connecting",
-        state.reconnectAttempts > 0 ? "reconnecting…" : "connecting…",
-    );
-    let ws;
-    try {
-        ws = new WebSocket(url);
-    } catch (e) {
-        console.error("ws construct failed", e);
-        scheduleReconnect();
-        return;
-    }
-    state.ws = ws;
-
-    ws.addEventListener("open", () => {
-        const wasReconnect = state.reconnectAttempts > 0;
-        state.reconnectAttempts = 0;
-        setConnStatus("connected", "connected");
-        if (wasReconnect) {
-            toast("Reconnected");
-            appendChatSystem("Reconnected to room.");
-        }
+class Engine {
+  constructor() {
+    const pageParams = new URLSearchParams(location.search);
+    const workerParams = new URLSearchParams({ v: window.MEGAGEM_BUILD || "dev" });
+    if (pageParams.get("pyodide")) workerParams.set("pyodide", pageParams.get("pyodide"));
+    this.worker = new Worker(`engine-worker.js?${workerParams}`);
+    this.pending = new Map();
+    this.nextId = 1;
+    this.status = "loading";
+    this.onStatus = () => {};
+    this.worker.onmessage = (e) => this._onMessage(e.data);
+    this.worker.onerror = (e) => this._setStatus("error", e.message || "Worker failed to start.");
+  }
+  _setStatus(status, detail) {
+    this.status = status;
+    this.detail = detail;
+    this.onStatus(status, detail);
+  }
+  _onMessage(msg) {
+    if (msg.type === "progress") return this._setStatus("loading", msg.stage);
+    if (msg.type === "ready") return this._setStatus("ready", "Python engine ready");
+    if (msg.type === "fatal") return this._setStatus("error", msg.error);
+    const p = this.pending.get(msg.id);
+    if (!p) return;
+    this.pending.delete(msg.id);
+    msg.ok ? p.resolve(msg.result) : p.reject(new Error(msg.error));
+  }
+  call(cmd, args = {}) {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.worker.postMessage({ id, cmd, args });
     });
-    ws.addEventListener("message", (evt) => {
-        try {
-            const msg = JSON.parse(evt.data);
-            handleServerMessage(msg);
-        } catch (e) {
-            console.error("bad ws message", e);
-        }
-    });
-    ws.addEventListener("close", () => {
-        if (state.ws === ws) state.ws = null;
-        if (state.wsClosedByUser) {
-            setConnStatus("offline", "offline");
-            return;
-        }
-        if (!state.roomCode) {
-            setConnStatus("offline", "offline");
-            return;
-        }
-        scheduleReconnect();
-    });
-    ws.addEventListener("error", () => {
-        // "error" always precedes "close"; let the close handler drive
-        // the reconnect. Just surface the first failure as a toast so
-        // the user sees *something*.
-        if (state.reconnectAttempts === 0) {
-            toast("Connection lost", "error");
-        }
-    });
+  }
 }
 
-function scheduleReconnect() {
-    if (!state.roomCode || !state.playerId) return;
-    if (state.wsClosedByUser) return;
-    state.reconnectAttempts += 1;
-    const delay = Math.min(
-        1000 * Math.pow(2, state.reconnectAttempts - 1),
-        RECONNECT_MAX_DELAY_MS,
-    );
-    const secs = Math.round(delay / 1000);
-    setConnStatus("reconnecting", `reconnecting in ${secs}s…`);
-    if (state.reconnectAttempts === 1) {
-        appendChatSystem("Connection lost — reconnecting…");
+// --------------------------------------------------------------------------
+// Preferences (per-browser convenience only)
+// --------------------------------------------------------------------------
+
+const PREFS_KEY = "megagem.prefs.v2";
+const defaultPrefs = { mode: "play", players: 4, name: "", chart: "A", explain: false, bots: ["evo4", "evo4", "evo4", "evo4", "evo4"] };
+
+function loadPrefs() {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    if (raw) return { ...defaultPrefs, ...JSON.parse(raw) };
+  } catch (_) { /* storage unavailable */ }
+  return { ...defaultPrefs };
+}
+function savePrefs() {
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify(prefs)); } catch (_) { /* ignore */ }
+}
+
+// --------------------------------------------------------------------------
+// App state
+// --------------------------------------------------------------------------
+
+const engine = new Engine();
+const prefs = loadPrefs();
+let game = null; // { config, view, token, busy, auto, autoTimer }
+let gameToken = 0;
+
+function showScreen(name) {
+  for (const s of ["setup", "game", "end"]) $(`screen-${s}`).hidden = s !== name;
+  $("nav-quit").hidden = name !== "game";
+  window.scrollTo({ top: 0 });
+}
+
+let toastTimer = null;
+function hideToast() {
+  clearTimeout(toastTimer);
+  $("toast").hidden = true;
+}
+function toast(html, { error = false, ms = 3200 } = {}) {
+  const el = $("toast");
+  el.innerHTML = html;
+  el.classList.toggle("error", error);
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (el.hidden = true), ms);
+}
+
+// --------------------------------------------------------------------------
+// Setup screen
+// --------------------------------------------------------------------------
+
+function seg(id, value, onChange) {
+  const el = $(id);
+  for (const b of el.querySelectorAll("button")) {
+    b.setAttribute("aria-pressed", String(b.dataset.value === String(value)));
+    b.onclick = () => onChange(b.dataset.value);
+  }
+}
+
+function botOptions(selected) {
+  return BOTS.map((b) => `<option value="${b.kind}"${b.kind === selected ? " selected" : ""}>${b.label} · ${b.tier}</option>`).join("");
+}
+
+function renderSetup() {
+  seg("mode-seg", prefs.mode, (v) => { prefs.mode = v; savePrefs(); renderSetup(); });
+  seg("players-seg", prefs.players, (v) => { prefs.players = Number(v); savePrefs(); renderSetup(); });
+  $("name-field").hidden = prefs.mode !== "play";
+  $("setup-name").value = prefs.name;
+  $("setup-explain").checked = prefs.explain;
+
+  const rows = [];
+  let botIdx = 0;
+  for (let i = 0; i < prefs.players; i++) {
+    if (i === 0 && prefs.mode === "play") {
+      rows.push(`<div class="seat you"><span class="seat-no">${i + 1}</span>
+        <span class="seat-name">${esc(prefs.name || "You")}<small>Human: that's you</small></span><span></span></div>`);
+      continue;
     }
-    state.reconnectTimer = setTimeout(() => {
-        state.reconnectTimer = null;
-        connectWebSocket();
-    }, delay);
+    const kind = prefs.bots[botIdx] || "evo4";
+    rows.push(`<div class="seat"><span class="seat-no">${i + 1}</span>
+      <span class="seat-name">${BOT_NAMES[botIdx]}<small>Bot seat</small></span>
+      <select data-bot="${botIdx}" aria-label="Bot for seat ${i + 1}">${botOptions(kind)}</select></div>`);
+    botIdx++;
+  }
+  $("seat-list").innerHTML = rows.join("");
+  for (const sel of $("seat-list").querySelectorAll("select")) {
+    sel.onchange = () => { prefs.bots[Number(sel.dataset.bot)] = sel.value; savePrefs(); };
+  }
+
+  $("setup-all").innerHTML = `<option value="">Set all bots to…</option>` + BOTS.map((b) => `<option value="${b.kind}">${b.label}</option>`).join("");
+
+  $("chart-picker").innerHTML = Object.entries(CHARTS).map(([key, c]) => {
+    const bars = c.values.map((v) => `<i style="height:${Math.max(6, (v / 20) * 100)}%"></i>`).join("");
+    return `<button type="button" class="chart-opt" data-chart="${key}" aria-pressed="${key === prefs.chart}" title="Chart ${key}: ${c.values.join(", ")}">
+      <b>${key}</b><span class="mini-bars">${bars}</span><small>${c.label}</small></button>`;
+  }).join("");
+  for (const b of $("chart-picker").querySelectorAll("button")) {
+    b.onclick = () => { prefs.chart = b.dataset.chart; savePrefs(); renderSetup(); };
+  }
 }
 
-function setConnStatus(cls, text) {
-    const el = $("conn-status");
-    if (!el) return;
-    el.className = "conn-status " + cls;
-    el.textContent = text;
-}
-
-function handleServerMessage(msg) {
-    switch (msg.type) {
-        case "welcome":
-            state.room = msg.room;
-            state.slotIndex = msg.slot_index;
-            renderLobby();
-            // On a mid-game reconnect the server won't re-send game_start,
-            // so detect the playing/done states and flip the screen now.
-            if (msg.room.status === "playing") {
-                showScreen("screen-game");
-            } else if (msg.room.status === "lobby") {
-                showScreen("screen-lobby");
-            }
-            break;
-        case "lobby_update":
-            state.room = msg.room;
-            renderLobby();
-            break;
-        case "game_start":
-            showScreen("screen-game");
-            $("g-log").innerHTML = "";
-            logEntry(`Game started — chart ${msg.chart}, ${msg.num_players} players`);
-            break;
-        case "state":
-            state.gameState = msg.state;
-            renderGame();
-            break;
-        case "round_start":
-            state.currentAuction = msg.auction;
-            logEntry(`— Round ${msg.round}: ${describeAuction(msg.auction)} —`);
-            $("g-auction").textContent = describeAuction(msg.auction);
-            $("g-revealed").replaceChildren(...msg.revealed_gems.map(gemEl));
-            setWaiting("Waiting for bids…");
-            break;
-        case "request_bid":
-            state.waitingOnBid = true;
-            state.currentMaxBid = msg.max_bid;
-            $("g-bid-panel").hidden = false;
-            $("g-bid-hint").textContent = `You have ${msg.my_coins} coins. Max legal bid: ${msg.max_bid}.`;
-            $("g-bid-input").max = msg.max_bid;
-            $("g-bid-input").value = Math.min(state.currentMaxBid, Number($("g-bid-input").value) || 0);
-            $("g-bid-input").focus();
-            $("g-bid-input").select();
-            setWaiting("");
-            break;
-        case "round_end":
-            state.waitingOnBid = false;
-            $("g-bid-panel").hidden = true;
-            renderRoundResult(msg.result);
-            setWaiting("Waiting for next round…");
-            break;
-        case "request_reveal":
-            state.waitingOnReveal = true;
-            $("g-reveal-panel").hidden = false;
-            setWaiting("You won — pick a gem from your hand to reveal.");
-            renderGame();  // re-render so the hand is clickable
-            break;
-        case "game_end":
-            renderScores(msg.scores);
-            showScreen("screen-end");
-            break;
-        case "session_cancelled":
-            toast("Session cancelled", "error");
-            break;
-        case "chat":
-            appendChatMessage(msg);
-            break;
-        case "error":
-            toast(msg.message || "Server error", "error");
-            break;
-        case "pong":
-            break;
-        default:
-            console.log("unhandled", msg);
+function setupConfig() {
+  const seats = [];
+  let botIdx = 0;
+  for (let i = 0; i < prefs.players; i++) {
+    if (i === 0 && prefs.mode === "play") {
+      seats.push({ kind: "human", name: (prefs.name || "You").slice(0, 20) });
+    } else {
+      const kind = prefs.bots[botIdx] || "evo4";
+      seats.push({ kind, name: BOT_NAMES[botIdx] });
+      botIdx++;
     }
+  }
+  const seedRaw = $("setup-seed").value.trim();
+  return { seats, chart: prefs.chart, explain: prefs.explain, seed: seedRaw === "" ? null : Math.abs(parseInt(seedRaw, 10)) || 0 };
 }
 
-// ---------------------------------------------------------------------------
-// Game rendering
-// ---------------------------------------------------------------------------
-
-function describeAuction(auction) {
-    if (!auction) return "—";
-    if (auction.kind === "treasure") return `Treasure (${auction.gems} gem${auction.gems !== 1 ? "s" : ""})`;
-    if (auction.kind === "loan") return `Loan (+${auction.amount} coins)`;
-    if (auction.kind === "invest") return `Invest (${auction.amount} coins)`;
-    return "?";
+function wireSetup() {
+  $("setup-name").addEventListener("input", (e) => {
+    prefs.name = e.target.value;
+    savePrefs();
+    const you = document.querySelector(".seat.you .seat-name");
+    if (you) you.firstChild.textContent = prefs.name || "You";
+  });
+  $("setup-explain").addEventListener("change", (e) => { prefs.explain = e.target.checked; savePrefs(); });
+  $("setup-all").addEventListener("change", (e) => {
+    if (!e.target.value) return;
+    prefs.bots = prefs.bots.map(() => e.target.value);
+    savePrefs();
+    renderSetup();
+  });
+  $("setup-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    startGame(setupConfig());
+  });
+  $("hero-gems").innerHTML = COLORS.map((c) => gem(c, "lg")).join("");
 }
 
-function gemEl(gem) {
-    return el("span", `gem ${gem.color}`, gem.color[0]);
+function renderEngineStatus(status, detail) {
+  const el = $("engine-status");
+  el.className = `engine-status ${status}`;
+  el.querySelector("span").textContent = detail || "";
+  $("setup-start").textContent = status === "ready" ? "Deal the cards" : status === "error" ? "Engine failed to load" : "Deal the cards (loading…)";
+  $("setup-start").disabled = status === "error";
 }
 
-function gemPillCount(color, count) {
-    const pill = el("span", `gem ${color}`, String(count));
-    return pill;
+// --------------------------------------------------------------------------
+// Game flow
+// --------------------------------------------------------------------------
+
+async function startGame(config) {
+  stopAuto();
+  const token = ++gameToken;
+  game = { config, view: null, token, busy: true, auto: false, autoTimer: null, log: [] };
+  hideToast();
+  $("g-log").innerHTML = "";
+  showScreen("game");
+  renderLoadingTable();
+  try {
+    const view = await engine.call("new", config);
+    if (token !== gameToken) return;
+    game.config.seed = view.seed; // pin the seed so Rematch replays this exact deal
+    handleView(view);
+  } catch (err) {
+    if (token !== gameToken) return;
+    toast(`Couldn't start the game: ${esc(err.message)}`, { error: true, ms: 8000 });
+    showScreen("setup");
+  }
+}
+
+async function act(cmd, args) {
+  if (!game || game.busy) return;
+  const token = game.token;
+  game.busy = true;
+  renderAction();
+  try {
+    const view = await engine.call(cmd, args);
+    if (token !== gameToken) return;
+    handleView(view);
+  } catch (err) {
+    if (token !== gameToken) return;
+    game.busy = false;
+    stopAuto();
+    renderAction();
+    toast(`Engine error: ${esc(err.message)}`, { error: true, ms: 8000 });
+  }
+}
+
+function handleView(view) {
+  game.view = view;
+  game.busy = false;
+  if (view.last_round) {
+    game.log.push(view.last_round);
+    appendLog(view.last_round, view);
+    if (view.human_idx !== null) toast(roundSummary(view.last_round, view), { ms: 4200 });
+  }
+  renderGame();
+  if (view.phase === "game_over") {
+    stopAuto();
+    setTimeout(() => { if (game && game.view === view) renderEnd(); }, view.human_idx === null ? 600 : 1400);
+  } else if (view.phase === "ready" && game.auto) {
+    scheduleAuto();
+  } else if (view.phase === "bid") {
+    requestAnimationFrame(() => { const inp = $("bid-num"); if (inp && window.matchMedia("(pointer:fine)").matches) inp.select(); });
+  }
+}
+
+function quitGame() {
+  if (game && game.view && game.view.phase !== "game_over" && !confirm("Abandon this game?")) return;
+  stopAuto();
+  gameToken++;
+  game = null;
+  showScreen("setup");
+}
+
+// Spectator autoplay ------------------------------------------------------
+
+function scheduleAuto() {
+  clearTimeout(game.autoTimer);
+  game.autoTimer = setTimeout(() => act("step"), Number($("sp-speed").value));
+}
+function stopAuto() {
+  if (!game) return;
+  game.auto = false;
+  clearTimeout(game.autoTimer);
+  $("sp-auto").innerHTML = 'Auto-play <span class="kbd">Space</span>';
+}
+function toggleAuto() {
+  if (!game || game.view?.phase !== "ready" && !game.busy) return;
+  if (game.auto) return stopAuto();
+  game.auto = true;
+  $("sp-auto").innerHTML = 'Pause <span class="kbd">Space</span>';
+  if (!game.busy) act("step");
+}
+
+// --------------------------------------------------------------------------
+// Rendering helpers
+// --------------------------------------------------------------------------
+
+const chartValue = (chart, n) => CHARTS[chart].values[Math.min(Math.max(n, 0), 5)];
+
+function seatLabel(view, i) {
+  const kind = view.seat_kinds[i];
+  return kind === "human" ? "You" : (BOT_BY_KIND[kind]?.label || kind);
+}
+
+function scoreNow(state, ps) {
+  const gems = COLORS.reduce((s, c) => s + (ps.collection[c] || 0) * chartValue(state.value_chart, state.value_display[c] || 0), 0);
+  const missions = ps.completed_missions.reduce((s, m) => s + m.coins, 0);
+  const loans = ps.loans.reduce((s, x) => s + x, 0);
+  const invest = ps.investments.reduce((s, x) => s + x.amount + x.locked, 0);
+  return ps.coins + gems + missions - loans + invest;
+}
+
+function auctionText(a) {
+  if (!a) return "";
+  if (a.kind === "treasure") return `Treasure ×${a.gems}`;
+  if (a.kind === "loan") return `Loan ${a.amount}`;
+  return `Invest ${a.amount}`;
+}
+
+function roundSummary(r, view) {
+  const name = esc(view.state.players[r.winner_idx].name);
+  const you = r.winner_idx === view.human_idx;
+  const gems = r.taken_gems.length ? ` and takes ${r.taken_gems.map((c) => gem(c, "sm")).join("")}` : "";
+  const missions = r.completed_missions.map((m) => `<br>${esc(view.state.players[m.player_idx].name)} completes <b>${esc(missionText(m.mission.name))}</b> (+${m.mission.coins})`).join("");
+  return `<b>Round ${r.round}:</b> ${you ? "You win" : `${name} wins`} ${auctionText(r.auction)} for ${coin(r.winning_bid)}${gems}.${missions}`;
+}
+
+// Mission text + a UI-only "how close am I" hint. The engine decides
+// completion; this just mirrors the requirement shapes in missions.py.
+const missionText = (name) => name.replace(/^[A-Za-z]+:\s*/, "");
+
+function missionReq(name) {
+  const text = missionText(name);
+  const specific = [...text.matchAll(/(\d+) (Blue|Green|Pink|Purple|Yellow)/g)];
+  if (specific.length) return specific.map(([, n, c]) => `${gem(c, "sm")}${Number(n) > 1 ? `×${n}` : ""}`).join('<span class="muted">+</span>');
+  return esc(text);
+}
+
+function missionNeed(name, collection) {
+  const text = missionText(name);
+  const counts = COLORS.map((c) => collection[c] || 0);
+  let m;
+  const specific = [...text.matchAll(/(\d+) (Blue|Green|Pink|Purple|Yellow)/g)];
+  if (specific.length) return specific.reduce((s, [, n, c]) => s + Math.max(0, Number(n) - (collection[c] || 0)), 0);
+  if ((m = text.match(/^(\d+) different colors/))) return Math.max(0, Number(m[1]) - counts.filter((n) => n > 0).length);
+  if ((m = text.match(/^(\d+) pairs/))) return [...counts].sort((a, b) => b - a).slice(0, Number(m[1])).reduce((s, n) => s + Math.max(0, 2 - n), 0);
+  if ((m = text.match(/^(\d+) of the same color/))) return Math.max(0, Number(m[1]) - Math.max(...counts));
+  return null;
+}
+
+// --------------------------------------------------------------------------
+// Game screen
+// --------------------------------------------------------------------------
+
+function renderLoadingTable() {
+  $("g-round").textContent = "Dealing…";
+  $("g-progress").style.width = "0%";
+  $("g-meta").innerHTML = "";
+  $("g-opponents").innerHTML = "";
+  $("g-auction").className = "auction";
+  $("g-auction").innerHTML = `<div class="waiting"><span class="spinner"></span><span>${esc(engine.status === "ready" ? "Shuffling…" : engine.detail || "Loading the engine…")}</span></div>`;
+  $("g-market").innerHTML = "";
+  $("g-chart-track").innerHTML = "";
+  $("g-missions").innerHTML = "";
+  $("g-you").hidden = true;
+  $("g-spectate").hidden = true;
+  $("g-log-count").textContent = "";
 }
 
 function renderGame() {
-    const s = state.gameState;
-    if (!s) return;
-    $("g-round").textContent = s.round_number;
-    $("g-chart").textContent = s.value_chart;
-    $("g-auction-left").textContent = s.auction_deck_count;
-    $("g-gem-left").textContent = s.gem_deck_count;
-    $("g-revealed").replaceChildren(...s.revealed_gems.map(gemEl));
+  const { view } = game;
+  const st = view.state;
+  const spectator = view.human_idx === null;
+  const current = view.phase === "bid" || view.phase === "ready" ? st.round_number + 1 : st.round_number;
+  $("g-round").textContent = view.phase === "game_over" ? "Final round played" : `Round ${current} of ${TOTAL_AUCTIONS}`;
+  $("g-progress").style.width = `${(st.round_number / TOTAL_AUCTIONS) * 100}%`;
+  $("g-meta").innerHTML = [
+    `<span class="chip">Chart ${st.value_chart} · ${CHARTS[st.value_chart].label}</span>`,
+    `<span class="chip">${st.auction_deck_count} auctions left</span>`,
+    `<span class="chip">${st.gem_deck_count} gems in deck</span>`,
+    `<span class="chip" title="Enter this seed on the setup screen to replay the same deal">Seed ${view.seed}</span>`,
+  ].join("");
 
-    // Value display (colors → counts)
-    $("g-display").replaceChildren(
-        ...Object.entries(s.value_display).map(([c, n]) => gemPillCount(c, n)),
-    );
-
-    // Missions
-    const missions = $("g-missions");
-    missions.innerHTML = "";
-    for (const m of s.active_missions) {
-        const li = el("li", `mission-item mission-${m.category}`);
-        const iconSpan = el("span", "mission-icon");
-        iconSpan.innerHTML = MISSION_ICONS[m.category] || "";
-        li.appendChild(iconSpan);
-        const textSpan = el("span", "mission-text");
-        textSpan.appendChild(el("span", "mission-label", m.category));
-        textSpan.appendChild(el("span", "mission-desc", missionDescription(m.name)));
-        li.appendChild(textSpan);
-        li.appendChild(el("span", "mission-coins", String(m.coins)));
-        missions.appendChild(li);
-    }
-
-    // Players
-    const players = $("g-players");
-    players.innerHTML = "";
-    s.players.forEach((p, idx) => {
-        const li = el("li");
-        if (idx === s.last_winner_idx) li.classList.add("winner");
-        if (idx === state.slotIndex) li.classList.add("self");
-        const top = el("div", "player-top");
-        top.appendChild(el("span", "", `${p.name}${p.is_human ? "" : " (AI)"}`));
-        top.appendChild(el("span", "", `${p.coins}c`));
-        li.appendChild(top);
-        const sub = el("div", "player-sub");
-        sub.appendChild(el("span", "", `hand: ${p.hand_size}`));
-        const missionsSpan = el("span", "player-missions");
-        missionsSpan.appendChild(document.createTextNode(`missions: ${p.completed_missions.length} `));
-        for (const cm of p.completed_missions) {
-            const mIcon = el("span", `mission-icon-sm mission-${cm.category}`);
-            mIcon.innerHTML = MISSION_ICONS[cm.category] || "";
-            missionsSpan.appendChild(mIcon);
-        }
-        sub.appendChild(missionsSpan);
-        const collection = el("span", "");
-        const pieces = Object.entries(p.collection).map(([c, n]) => `${c[0]}×${n}`);
-        collection.textContent = pieces.length ? "gems: " + pieces.join(" ") : "gems: none";
-        sub.appendChild(collection);
-        li.appendChild(sub);
-        players.appendChild(li);
-    });
-
-    // Your seat
-    const you = s.players[state.slotIndex];
-    if (you) {
-        $("g-you-name").textContent = you.name;
-        $("g-you-coins").textContent = you.coins;
-        $("g-you-hand-count").textContent = you.hand ? you.hand.length : you.hand_size;
-        const handDiv = $("g-you-hand");
-        handDiv.innerHTML = "";
-        if (you.hand) {
-            you.hand.forEach((gem) => {
-                const node = gemEl(gem);
-                if (state.waitingOnReveal) {
-                    node.classList.add("clickable");
-                    node.onclick = () => submitReveal(gem.color);
-                }
-                handDiv.appendChild(node);
-            });
-        }
-        const collectionDiv = $("g-you-collection");
-        collectionDiv.replaceChildren(
-            ...Object.entries(you.collection).map(([c, n]) => gemPillCount(c, n)),
-        );
-    }
+  renderSeats();
+  renderAuction();
+  renderMarket($("g-market"), st, spectator ? null : st.players[view.human_idx]);
+  renderChartTrack();
+  renderMissions();
+  $("g-you").hidden = spectator;
+  $("g-spectate").hidden = !spectator;
+  if (!spectator) renderYou();
+  renderAction();
+  $("g-log-count").textContent = game.log.length ? `${game.log.length} played` : "";
 }
 
-function renderRoundResult(result) {
-    const winner = state.gameState?.players[result.winner_idx];
-    const winnerName = winner ? winner.name : `seat ${result.winner_idx}`;
-    const bids = result.bids.join(", ");
-    const entry = `R${result.round}: ${describeAuction(result.auction)} — bids [${bids}] — winner: ${winnerName} (${result.winning_bid})`;
-    logEntry(entry, "winner");
-    if (result.taken_gems.length) {
-        logEntry(`  → ${winnerName} took ${result.taken_gems.map((g) => g.color).join(", ")}`);
-    }
-    if (result.revealed_gem) {
-        logEntry(`  → ${winnerName} revealed a ${result.revealed_gem.color}`);
-    }
-    for (const comp of result.completed_missions) {
-        const p = state.gameState?.players[comp.player_idx];
-        logEntry(`  ★ ${p ? p.name : "seat " + comp.player_idx} completed: ${comp.mission.name}`, `mission-log-${comp.mission.category}`);
-    }
+function renderSeats() {
+  const { view } = game;
+  const st = view.state;
+  const last = view.last_round || game.log[game.log.length - 1] || null;
+  $("g-opponents").innerHTML = st.players.map((ps, i) => {
+    const isYou = i === view.human_idx;
+    const winner = last && last.winner_idx === i;
+    const kind = view.seat_kinds[i];
+    const bot = BOT_BY_KIND[kind];
+    const hand = ps.hand
+      ? `<div class="gem-row">${gemList(ps.hand, "sm")}</div>`
+      : `<span class="hand-backs" title="${ps.hand_size} gems in hand">${"<i></i>".repeat(ps.hand_size)}</span>`;
+    const extras = [
+      ...ps.loans.map((a) => `<span class="chip loan">Loan −${a}</span>`),
+      ...ps.investments.map((x) => `<span class="chip invest">Invest ${x.locked}+${x.amount}</span>`),
+      ...ps.completed_missions.map((m) => `<span class="chip mission" title="${esc(m.name)}">★ +${m.coins}</span>`),
+    ].join("");
+    return `<article class="seat-card${winner ? " winner" : ""}${isYou ? " you" : ""}">
+      ${last ? `<span class="last-bid">${winner ? "won · " : ""}bid ${last.bids[i]}</span>` : ""}
+      <div class="seat-card-head">
+        <div class="who"><b>${esc(ps.name)}</b>${isYou ? '<span class="chip">You</span>' : `<span class="chip kind" title="${esc(bot?.tier || "")}">${esc(bot?.label || kind)}</span>`}</div>
+        ${coin(ps.coins)}
+      </div>
+      <div class="stats"><span>Hand</span>${hand}</div>
+      <div class="stats"><span>Collected</span><span class="gem-row">${gemCounts(ps.collection)}</span></div>
+      ${extras ? `<div class="stats">${extras}</div>` : ""}
+      <div class="score-now" title="Coins + collected gems at today's values + missions + investments − loans (hands not counted)">Worth now: <b>${scoreNow(st, ps)}</b></div>
+    </article>`;
+  }).join("");
 }
 
-function renderScores(scores) {
-    const list = $("end-scores");
-    const sorted = scores
-        .map((s, i) => ({ ...s, idx: i }))
-        .sort((a, b) => b.total - a.total);
-    list.innerHTML = "";
-    for (const row of sorted) {
-        const li = el(
-            "li",
-            "",
-            `${row.name} — ${row.total} (${row.coins}c + ${row.gem_value}gems + ${row.mission_value}miss + ${row.invest_returns}inv − ${row.loans_total}loan)`,
-        );
-        list.appendChild(li);
-    }
+function renderAuction() {
+  const { view } = game;
+  const st = view.state;
+  const el = $("g-auction");
+  const a = view.auction;
+  if (!a) {
+    el.className = "auction";
+    el.innerHTML = `<div class="auction-kind">Auction deck empty</div><div class="auction-title">Scoring…</div>`;
+    return;
+  }
+  el.className = `auction ${a.kind}`;
+  const won = view.phase === "reveal" ? `<span class="chip mission">You won this auction</span>` : "";
+  let body = "";
+  if (a.kind === "treasure") {
+    // In the reveal phase the gems have already moved into your collection.
+    const offered = view.phase === "reveal" ? [] : st.revealed_gems;
+    const slots = offered.map((c, i) => `<span class="slot${i < a.gems ? "" : " off"}" title="${i < a.gems ? "Goes to the winner" : "Stays face-up"}">${gem(c, "xl")}</span>`).join("");
+    const value = offered.slice(0, a.gems).reduce((s, c) => s + chartValue(st.value_chart, st.value_display[c] || 0), 0);
+    body = `<div class="auction-title">Treasure ×${a.gems}</div>
+      ${view.phase === "reveal" ? "" : `<div class="auction-gems">${slots || '<span class="empty">no gems left</span>'}</div>`}
+      <div class="auction-sub">${view.phase === "reveal" ? "The gems are in your collection." : `Winner takes the highlighted gem${a.gems > 1 ? "s" : ""}. Worth ${coin(value)} at today's display.`}</div>`;
+  } else if (a.kind === "loan") {
+    body = `<div class="auction-title">Loan ${coin(a.amount)}</div>
+      <div class="auction-sub">Winner pays their bid, receives ${a.amount} now and repays ${a.amount} at game end. You may bid up to your coins + ${a.amount}.</div>`;
+  } else {
+    body = `<div class="auction-title">Invest ${coin(a.amount)}</div>
+      <div class="auction-sub">Winner's bid is locked away and paid back at game end with a +${a.amount} bonus.</div>`;
+  }
+  el.innerHTML = `<div class="auction-kind">${a.kind}</div>${won}${body}
+    <div class="auction-deck">${st.auction_deck_count - (view.phase === "reveal" ? 0 : 1)} more auction cards after this</div>`;
 }
 
-function logEntry(text, cls) {
-    const log = $("g-log");
-    const entry = el("div", "entry" + (cls ? " " + cls : ""), text);
-    log.appendChild(entry);
-    log.scrollTop = log.scrollHeight;
+function renderMarket(el, st, me, { final = false } = {}) {
+  el.innerHTML = COLORS.map((c) => {
+    const n = st.value_display[c] || 0;
+    const val = chartValue(st.value_chart, n);
+    const nxt = chartValue(st.value_chart, n + 1);
+    const dir = nxt > val ? "up" : nxt < val ? "down" : "";
+    const pips = Array.from({ length: 5 }, (_, i) => `<i class="${i < n ? "on" : ""}"></i>`).join("");
+    const owned = st.players.reduce((s, p) => s + (p.collection[c] || 0), 0);
+    const mine = me
+      ? `hand ${(me.hand || []).filter((x) => x === c).length}<br>owned ${me.collection[c] || 0}`
+      : `collected ${owned}`;
+    return `<div class="mcol" style="color:${COLOR_HEX[c]}">
+      ${gem(c, "lg")}
+      <span class="pips" title="${n} in display">${pips}</span>
+      <span class="val" style="color:var(--text)">${val}</span>
+      ${final ? "" : `<span class="next ${dir}" title="Value if one more ${c} is revealed">${n >= 5 ? "maxed" : `next → ${nxt}`}</span>`}
+      <span class="mine">${mine}</span>
+    </div>`;
+  }).join("");
 }
 
-function setWaiting(text) {
-    $("g-waiting").textContent = text;
+function renderChartTrack() {
+  const st = game.view.state;
+  const vals = CHARTS[st.value_chart].values;
+  $("g-chart-name").textContent = `· chart ${st.value_chart}`;
+  $("g-chart-track").innerHTML =
+    `<span class="label">in display</span>${vals.map((_, i) => `<span>${i === 5 ? "5+" : i}</span>`).join("")}` +
+    `<span class="label">gem worth</span>${vals.map((v) => `<span style="color:var(--text);font-weight:600">${v}</span>`).join("")}`;
 }
 
-// ---------------------------------------------------------------------------
-// Player actions
-// ---------------------------------------------------------------------------
-
-function submitBid() {
-    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
-    if (!state.waitingOnBid) return;
-    let amount = Number($("g-bid-input").value);
-    if (!Number.isFinite(amount) || amount < 0) amount = 0;
-    if (state.currentMaxBid != null && amount > state.currentMaxBid) amount = state.currentMaxBid;
-    state.ws.send(JSON.stringify({ type: "bid", amount }));
-    state.waitingOnBid = false;
-    $("g-bid-panel").hidden = true;
-    setWaiting("Bid submitted. Waiting for other players…");
+function renderMissions() {
+  const { view } = game;
+  const st = view.state;
+  const me = view.human_idx === null ? null : st.players[view.human_idx];
+  $("g-missions-left").textContent = `${st.active_missions.length} open`;
+  if (!st.active_missions.length) {
+    $("g-missions").innerHTML = '<span class="empty">All missions claimed.</span>';
+    return;
+  }
+  $("g-missions").innerHTML = st.active_missions.map((m) => {
+    const need = me ? missionNeed(m.name, me.collection) : null;
+    const close = need === 1;
+    const note = need === null ? "" : `<span class="progress-note">${need === 0 ? "Complete!" : `You need ${need} more gem${need > 1 ? "s" : ""}`}</span>`;
+    return `<div class="mission${close ? " close" : ""}" title="${esc(m.name)}">
+      <div class="mission-head"><span>${esc(m.category)}</span>${coin(m.coins)}</div>
+      <div class="mission-req">${missionReq(m.name)}</div>${note}</div>`;
+  }).join("");
 }
 
-function submitReveal(color) {
-    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
-    if (!state.waitingOnReveal) return;
-    state.ws.send(JSON.stringify({ type: "reveal", color }));
-    state.waitingOnReveal = false;
-    $("g-reveal-panel").hidden = true;
-    setWaiting("Revealed. Resolving round…");
+function renderYou() {
+  const { view } = game;
+  const me = view.state.players[view.human_idx];
+  $("g-you-name").textContent = me.name;
+  $("g-you-score").innerHTML = `worth now <b style="color:var(--text)">${scoreNow(view.state, me)}</b>`;
+  $("g-you-stats").innerHTML = `${coin(me.coins)}<span class="muted small">coins to bid with</span>`;
+  $("g-you-hand").innerHTML = gemList(me.hand || [], "lg");
+  $("g-you-collection").innerHTML = gemCounts(me.collection, "");
+  const extras = [
+    ...me.loans.map((a) => `<span class="chip loan">Loan: repay ${a}</span>`),
+    ...me.investments.map((x) => `<span class="chip invest">Invest: ${x.locked} + ${x.amount} back</span>`),
+    ...me.completed_missions.map((m) => `<span class="chip mission">★ ${esc(missionText(m.name))} +${m.coins}</span>`),
+  ];
+  $("g-you-extras").innerHTML = extras.length ? `<h4>Loans, investments, missions</h4><div class="gem-row">${extras.join("")}</div>` : "";
 }
 
-// ---------------------------------------------------------------------------
-// Chat
-// ---------------------------------------------------------------------------
-
-function onChatSubmit(event) {
-    event.preventDefault();
-    const input = $("chat-input");
-    const text = input.value.trim().slice(0, 200);
-    if (!text) return;
-    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-        toast("Not connected — can't send chat", "error");
-        return;
-    }
-    state.ws.send(JSON.stringify({ type: "chat", text }));
-    input.value = "";
+function renderAction() {
+  const el = $("g-action");
+  if (!game || !game.view) return;
+  const { view } = game;
+  el.classList.remove("live");
+  if (view.human_idx === null) {
+    $("sp-step").disabled = game.busy || view.phase !== "ready";
+    return;
+  }
+  if (game.busy) {
+    el.innerHTML = `<div class="waiting"><span class="spinner"></span>Bots are bidding…</div>`;
+    return;
+  }
+  if (view.phase === "bid") return renderBid(el);
+  if (view.phase === "reveal") return renderReveal(el);
+  el.innerHTML = `<div class="waiting">Game over: tallying scores…</div>`;
 }
 
-function appendChatMessage(msg) {
-    state.chatMessages.push({
-        kind: "user",
-        from: msg.from,
-        fromIdx: msg.from_idx,
-        text: msg.text,
-        ts: Date.now(),
-    });
-    // Cap history to avoid unbounded memory growth on long sessions.
-    if (state.chatMessages.length > 200) state.chatMessages.shift();
-    renderChat();
+function renderBid(el) {
+  const { view } = game;
+  const st = view.state;
+  const a = view.auction;
+  const max = view.max_bid;
+  const me = st.players[view.human_idx];
+  let hint = "";
+  if (a.kind === "treasure") {
+    const worth = st.revealed_gems.slice(0, a.gems).reduce((s, c) => s + chartValue(st.value_chart, st.value_display[c] || 0), 0);
+    hint = `The gem${a.gems > 1 ? "s are" : " is"} worth ${coin(worth)} at today's display. Final value depends on what gets revealed.`;
+  } else if (a.kind === "invest") {
+    hint = `Whatever you pay comes back at the end, plus ${a.amount}. It just ties up coins.`;
+  } else {
+    hint = `Your bid is a cost: the ${a.amount} you receive is repaid at the end. Worth it only if you need cash now.`;
+  }
+  const quick = [...new Set([0, 1, Math.round(max / 4), Math.round(max / 2), max])].filter((v) => v <= max);
+  el.classList.add("live");
+  el.innerHTML = `<h3>Your sealed bid</h3>
+    <p class="muted small" style="margin:0">${hint}</p>
+    <div class="bid-amount">
+      <input id="bid-num" type="number" min="0" max="${max}" value="0" inputmode="numeric" aria-label="Bid amount">
+      <span class="of">of ${max} max${a.kind === "loan" ? ` (${me.coins} + loan)` : ""}</span>
+    </div>
+    <input id="bid-range" type="range" min="0" max="${max}" value="0" aria-label="Bid slider">
+    <div class="quick">${quick.map((v) => `<button type="button" class="btn sm ghost" data-q="${v}">${v === max ? `All in (${v})` : v}</button>`).join("")}</div>
+    <button id="bid-go" type="button" class="btn primary lg block">Bid 0 <span class="kbd">Enter</span></button>`;
+  const num = $("bid-num"), range = $("bid-range"), go = $("bid-go");
+  const set = (v) => {
+    v = Math.max(0, Math.min(max, Math.round(Number(v) || 0)));
+    num.value = v; range.value = v;
+    go.innerHTML = `Bid ${v} <span class="kbd">Enter</span>`;
+  };
+  num.oninput = () => set(num.value);
+  range.oninput = () => set(range.value);
+  for (const b of el.querySelectorAll("[data-q]")) b.onclick = () => set(b.dataset.q);
+  const submit = () => { set(num.value); act("bid", { amount: Number(num.value) }); };
+  go.onclick = submit;
+  num.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } };
 }
 
-function appendChatSystem(text) {
-    state.chatMessages.push({ kind: "system", text, ts: Date.now() });
-    if (state.chatMessages.length > 200) state.chatMessages.shift();
-    renderChat();
+function renderReveal(el) {
+  const { view } = game;
+  const st = view.state;
+  const me = st.players[view.human_idx];
+  const options = [...new Set(me.hand)];
+  el.classList.add("live");
+  el.innerHTML = `<h3>You won! Reveal a gem</h3>
+    <p class="muted small" style="margin:0">Pick one gem from your hand to add to the Value Display. It changes what every gem of that colour is worth, for you and for everyone else.</p>
+    <div class="reveal-options">${options.map((c) => {
+      const n = st.value_display[c] || 0;
+      const before = chartValue(st.value_chart, n), after = chartValue(st.value_chart, n + 1);
+      const owned = me.collection[c] || 0;
+      const swing = (after - before) * owned;
+      const cls = after > before ? "pos" : after < before ? "neg" : "";
+      return `<button type="button" class="reveal-opt" data-color="${c}">${gem(c, "lg")}
+        <span><b>${c}</b><br><span class="delta">worth <b>${before}</b> → <b class="${cls}">${after}</b> each · your ${owned} collected: <b class="${cls}">${swing >= 0 ? "+" : ""}${swing}</b></span></span></button>`;
+    }).join("")}</div>`;
+  for (const b of el.querySelectorAll("[data-color]")) b.onclick = () => act("reveal", { color: b.dataset.color });
 }
 
-function renderChat() {
-    const container = $("chat-messages");
-    if (!container) return;
-    container.innerHTML = "";
-    if (state.chatMessages.length === 0) {
-        container.appendChild(el("div", "chat-empty", "No messages yet."));
-        return;
-    }
-    for (const m of state.chatMessages) {
-        if (m.kind === "system") {
-            container.appendChild(el("div", "chat-entry system", m.text));
-            continue;
-        }
-        const isSelf = m.fromIdx === state.slotIndex;
-        const entry = el("div", "chat-entry" + (isSelf ? " self" : ""));
-        entry.appendChild(el("span", "chat-from", `${m.from}:`));
-        entry.appendChild(document.createTextNode(m.text));
-        container.appendChild(entry);
-    }
-    container.scrollTop = container.scrollHeight;
+function appendLog(r, view) {
+  const st = view.state;
+  const rationale = r.rationale
+    ? `<details><summary>Bot reasoning</summary><div class="rationale">${r.rationale.map((x, i) => x
+        ? `<div><b>${esc(st.players[i].name)}</b> <span class="muted small">${esc(x.ai_class)} · bid ${r.bids[i]}</span><pre>${esc(x.lines.join("\n") || "(no detail)")}</pre></div>`
+        : "").join("")}</div></details>`
+    : "";
+  const missions = r.completed_missions.map((m) => `<div>★ ${esc(st.players[m.player_idx].name)}: ${esc(missionText(m.mission.name))} <b>+${m.mission.coins}</b></div>`).join("");
+  const div = document.createElement("div");
+  div.className = "log-entry fresh";
+  div.innerHTML = `<div class="log-head"><span>Round ${r.round} · <b>${auctionText(r.auction)}</b></span><span><b>${esc(st.players[r.winner_idx].name)}</b> wins</span></div>
+    <div class="log-bids">${r.bids.map((b, i) => `<span class="chip${i === r.winner_idx ? " win" : ""}" title="${esc(seatLabel(view, i))}">${esc(st.players[i].name)} ${b}</span>`).join("")}</div>
+    <div class="gem-row">${r.taken_gems.length ? `<span class="muted small">took</span>${gemList(r.taken_gems, "sm")}` : ""}
+      ${r.revealed_gem ? `<span class="muted small">revealed</span>${gem(r.revealed_gem, "sm")}` : ""}</div>
+    ${missions}${rationale}`;
+  const log = $("g-log");
+  log.prepend(div);
 }
 
-// ---------------------------------------------------------------------------
-// Wiring
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------
+// End screen
+// --------------------------------------------------------------------------
 
-function leaveRoom() {
-    state.wsClosedByUser = true;
-    if (state.reconnectTimer) {
-        clearTimeout(state.reconnectTimer);
-        state.reconnectTimer = null;
-    }
-    if (state.ws) {
-        try { state.ws.close(); } catch {}
-    }
-    clearSession();
-    showScreen("screen-menu");
+function renderEnd() {
+  const { view, config } = game;
+  const rows = view.scores.map((s, i) => ({ ...s, i })).sort((a, b) => b.total - a.total);
+  const top = rows[0].total;
+  const winners = rows.filter((r) => r.total === top);
+  const youWon = winners.some((r) => r.i === view.human_idx);
+  let title;
+  if (view.human_idx === null) title = winners.length > 1 ? "A shared victory" : `${esc(winners[0].name)} wins`;
+  else if (youWon) title = winners.length > 1 ? "You tied for the win!" : "You win!";
+  else title = `${esc(winners[0].name)} wins`;
+  $("end-title").innerHTML = title;
+  const myRank = view.human_idx === null ? null : rows.findIndex((r) => r.i === view.human_idx) + 1;
+  $("end-sub").textContent = [
+    myRank && !youWon ? `You finished #${myRank} of ${rows.length}` : null,
+    `Chart ${view.state.value_chart}`,
+    `${rows.length} players`,
+    `seed ${view.seed}`,
+  ].filter(Boolean).join(" · ");
+  $("end-gems").innerHTML = COLORS.map((c) => gem(c, "lg")).join("");
+
+  let rank = 0, prev = null;
+  $("end-scores").innerHTML = rows.map((r, n) => {
+    if (r.total !== prev) { rank = n + 1; prev = r.total; }
+    const hand = view.final_hands?.[r.i] || [];
+    return `<tr class="${r.total === top ? "first" : ""}${r.i === view.human_idx ? " me" : ""}">
+      <td><span class="rank">${rank}</span><b>${esc(r.name)}</b> ${r.i === view.human_idx ? "" : `<span class="chip kind">${esc(seatLabel(view, r.i))}</span>`}
+        ${hand.length ? `<div class="gem-row" style="margin-top:4px"><span class="muted small">hand</span>${gemList(hand, "sm")}</div>` : ""}</td>
+      <td>${r.coins}</td><td>${r.gem_value}</td><td>${r.mission_value}</td>
+      <td class="${r.invest_returns ? "pos" : ""}">${r.invest_returns ? "+" + r.invest_returns : 0}</td>
+      <td class="${r.loans_total ? "neg" : ""}">${r.loans_total ? "−" + r.loans_total : 0}</td>
+      <td class="total">${r.total}</td></tr>`;
+  }).join("");
+  renderMarket($("end-market"), view.state, null, { final: true });
+  hideToast();
+  showScreen("end");
+  $("end-rematch").onclick = () => startGame({ ...config });
+  $("end-again").onclick = () => startGame({ ...config, seed: null });
 }
 
-function wireUp() {
-    $("menu-quick-play").onclick = onQuickPlay;
-    $("menu-create").onclick = onCreateRoom;
-    $("menu-join").onclick = onJoinRoom;
-    $("lobby-add-ai").onclick = onAddAI;
-    $("lobby-start").onclick = onStartGame;
-    $("lobby-chart").onchange = (e) => onConfigureChart(e.target.value);
-    $("lobby-seed").onchange = (e) => onConfigureSeed(e.target.value);
-    $("g-bid-submit").onclick = submitBid;
-    $("g-bid-input").addEventListener("keydown", (e) => {
-        if (e.key === "Enter") submitBid();
-    });
-    $("chat-form").addEventListener("submit", onChatSubmit);
-    $("leave").onclick = leaveRoom;
-    $("end-back").onclick = leaveRoom;
-    window.addEventListener("beforeunload", () => {
-        // Don't trigger reconnect loops on a real navigation away.
-        state.wsClosedByUser = true;
-    });
+// --------------------------------------------------------------------------
+// Boot
+// --------------------------------------------------------------------------
 
-    // Auto-rejoin if a previous session is still valid.
-    if (restoreSession()) {
-        api("GET", `/api/rooms/${state.roomCode}`)
-            .then((data) => {
-                state.room = data.room;
-                renderLobby();
-                // If the game is already playing, welcome handler will
-                // re-send a state snapshot and flip us to screen-game;
-                // start on lobby for the lobby case.
-                showScreen("screen-lobby");
-                connectWebSocket();
-            })
-            .catch(() => {
-                clearSession();
-                showScreen("screen-menu");
-            });
-    } else {
-        showScreen("screen-menu");
-    }
-}
+engine.onStatus = renderEngineStatus;
+renderEngineStatus(engine.status, "Starting the Python engine…");
+wireSetup();
+renderSetup();
 
-document.addEventListener("DOMContentLoaded", wireUp);
+$("nav-quit").onclick = quitGame;
+$("end-setup").onclick = () => { game = null; showScreen("setup"); };
+$("sp-step").onclick = () => { stopAuto(); act("step"); };
+$("sp-auto").onclick = toggleAuto;
+$("sp-speed").onchange = () => { if (game?.auto && !game.busy) scheduleAuto(); };
+
+document.addEventListener("keydown", (e) => {
+  if (!game || $("screen-game").hidden || e.target.matches("input, select, textarea")) return;
+  const phase = game.view?.phase;
+  if (phase === "ready" || (game.auto && game.busy)) {
+    if (e.key === " ") { e.preventDefault(); toggleAuto(); }
+    else if (e.key.toLowerCase() === "n" && phase === "ready") { stopAuto(); act("step"); }
+  } else if (phase === "bid" && e.key === "Enter" && !e.target.matches("button")) {
+    e.preventDefault();
+    $("bid-go")?.click();
+  }
+});

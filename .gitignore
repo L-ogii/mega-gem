@@ -104,3 +104,6 @@ data/
 *.db-journal
 *.db-wal
 *.db-shm
+
+# GitHub Pages build output (python web/build.py)
+_site/
