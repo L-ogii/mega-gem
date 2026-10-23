@@ -6,16 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repo layout
 
-The canonical Python engine, AI zoo, tests, GA tuners, and checked-in weights all live under **`research/`**. The multiplayer stack (`server/`, `web/`) lives at the repo root. **Every research-side Python command (CLI, tests, GA) must be run from inside `research/`** — those scripts resolve paths like `saved_best_weights/` and `artifacts/` relative to the current working directory. **The multiplayer server runs from the repo root** — it resolves weights via `Path(__file__)` so it does not care about the CWD.
+This is a research repo. The canonical Python engine, AI zoo, tests, GA tuners, and checked-in weights all live under **`research/`**. The static single-player web client (`web/`, deployed to GitHub Pages) lives at the repo root. **Every research-side Python command (CLI, tests, GA) must be run from inside `research/`**: those scripts resolve paths like `saved_best_weights/` and `artifacts/` relative to the current working directory. **The site build (`python web/build.py`) runs from the repo root**; it resolves paths via `Path(__file__)`.
 
 ```
 mega-gem/
-├── server/             # FastAPI + WebSocket multiplayer server
-├── web/                # browser client (served by server/) — quick play vs bots + multiplayer
-├── requirements.txt    # fastapi / uvicorn / pydantic (server deps)
-├── nixpacks.toml       # Railway build config
-├── Procfile            # Railway start command
-├── railway.json        # Railway service config + healthcheck
+├── web/                # static client: runs research/megagem in Pyodide (GitHub Pages)
+├── .github/workflows/  # pages.yml: tests on push/PR, deploys Pages from main
 ├── README.md
 ├── CLAUDE.md
 └── research/           # Python engine + AI zoo + GA tuners + tests
@@ -31,7 +27,7 @@ mega-gem/
 ```bash
 cd research
 
-# Tests (stdlib unittest, no pytest, 120 tests, sub-second)
+# Tests (stdlib unittest, no pytest, 122 tests, ~1s)
 python -m unittest discover
 python -m unittest tests.test_heuristic -v
 python -m unittest tests.test_evo2 -v
@@ -57,19 +53,16 @@ python -m scripts.heatmap_pairwise                              # requires saved
 
 ```
 
-### Multiplayer server (from the repo root)
+### Web client (from the repo root)
 
 ```bash
 # From mega-gem/, NOT from inside research/.
-pip install -r requirements.txt
-uvicorn server.main:app --reload    # → http://127.0.0.1:8000/
+python web/build.py                 # → _site/ (gitignored): web files + megagem.zip
+python -m http.server -d _site      # → http://127.0.0.1:8000/
+# Offline: unpack `npm pack pyodide@0.29.5` into _site/pyodide/ and open /?pyodide=/pyodide/
 ```
 
-`server/__init__.py` prepends `research/` to `sys.path` so
-`from megagem.engine import play_round` resolves against the canonical
-engine without needing an editable install. Weights are loaded from
-`research/saved_best_weights/` via `Path(__file__)`, so the server
-does not care about CWD.
+`megagem.zip` holds `research/megagem/**/*.py` + `research/saved_best_weights/*.json`, so **rebuild after any engine/AI change or weights promotion**. CI (`.github/workflows/pages.yml`) does this on every push to `main`.
 
 ### Weights workflow
 
@@ -80,33 +73,27 @@ python -m scripts.evolve --ai evo3
 cp artifacts/best_weights_evo3_vs_all_4p.json saved_best_weights/
 ```
 
-The `saved_best_weights/` folder currently holds:
-- `best_weights_evo1_vs_heuristic_4p.json` — HyperAdaptiveSplitAI (89% vs 3× HeuristicAI)
-- `best_weights_evo2_vs_evo1_4p.json` — Evo2AI trained vs HyperAdaptiveSplitAI (69%) *(the `--opponent vs_all` retrain is in progress; promote the fresh file into `saved_best_weights/` when it lands)*
-- `best_weights_evo3_vs_all_4p.json` — Evo3AI trained against all 6 prior bots (70% pooled)
+The `saved_best_weights/` folder currently holds one `vs_all` 4p file per profile: `best_weights_evo{1,2,3,4}_vs_all_4p.json`. The site reads the same files (packed into `megagem.zip`).
 
 ## Dependencies
 
 - Python engine, CLI, and tests: **stdlib only**.
 - `scripts/evolve/` and `scripts/heatmap_pairwise.py`: `pip install matplotlib` (forced to `Agg` backend).
-- `server/` multiplayer server: `fastapi`, `uvicorn[standard]`, `pydantic` (see `requirements.txt`).
-- `web/` browser client: zero dependencies, vanilla JS.
+- `web/` browser client: vanilla JS; loads Pyodide (`pyodide@0.29.5`, Python 3.13) from jsDelivr at runtime. `web/build.py` is stdlib only.
 
 ## Architecture
 
 ### Single canonical engine
 
-The repo has one game engine: `research/megagem/` (Python). The terminal CLI, test suite, GA tuners, and `server/` all use it. The browser client in `web/` is a **thin client** — it doesn't run any game logic. It talks to `server/` over REST + WebSocket and renders whatever state the server sends. Both quick-play (vs bots) and multiplayer games run the canonical Python engine on the server.
+The repo has one game engine: `research/megagem/` (Python). The terminal CLI, test suite, GA tuners, and the web client all use it. **There is no JS port of the rules**: `web/engine-worker.js` boots Pyodide in a Web Worker, unpacks `megagem.zip`, and drives `megagem.browser.BrowserSession`. `web/app.js` only renders the JSON views the session returns and posts back bids/reveals.
 
-### Multiplayer server (`server/`)
+### Web client (`web/` + `research/megagem/browser.py`)
 
-- `server/__init__.py` prepends `research/` to `sys.path` — every other module in `server/` can then write `from megagem.engine import play_round` normally.
-- `server/rooms.py` — `RoomManager` + `Room` + `Slot`. Rooms are keyed on a 5-char share code and held entirely in process memory. A Railway redeploy wipes active rooms — that's acceptable for the MVP.
-- `server/session.py` — `GameSession`. The canonical engine is **synchronous**, so each room spawns a dedicated `threading.Thread` that calls `play_round` in a loop. Humans are wired up via `RemotePlayer` (`server/remote_player.py`), whose `choose_bid` and `choose_gem_to_reveal` block on thread-safe `queue.Queue` instances. The WS handler does `queue.put(amount)` when a bid arrives; the game thread unblocks and proceeds. Broadcasts go the other way via `asyncio.run_coroutine_threadsafe(room.broadcast(...), self.loop)`.
-- **Before `play_round` runs**, the session peeks at `state.auction_deck[-1]` and broadcasts a `round_start` message so human clients can render the card while the engine is about to start blocking on their bid.
-- **Pending-request tracking.** `GameSession._pending_requests[idx]` stores the last unanswered `request_bid` / `request_reveal` per seat. On WS reconnect, `server/main.py`'s welcome handler re-sends the current state *and* the pending request, so a mid-game page refresh picks up exactly where it left off instead of leaving the player staring at a frozen board while the engine thread is still blocked on their queue.
-- `server/protocol.py` — single source of truth for JSON serialization of engine objects. The engine's `GameState` is a dataclass full of `Counter[Color]` / `AuctionCard` / `MissionCard` references; nothing in `server.session` should poke at these directly, it should always go through `serialize_state`, `serialize_auction`, etc.
-- `server/ai_factory.py` — a trimmed mirror of `research/megagem/__main__.py`'s `AI_FACTORIES` dict. Only the playable kinds (`random`, `heuristic`, `evo4`) are wired up here — earlier evo generations still exist in `research/` for the GA/CLI, but the multiplayer server intentionally only exposes the current champion so players aren't overwhelmed with near-duplicate difficulty levels. Weights are loaded from `research/saved_best_weights/` via an absolute `Path(__file__)`, and missing weights fall back to class defaults with no error (unlike the CLI's `evolved` factory, which raises). The server should *never crash* because a weights file is missing.
+- `megagem/browser.py` is a frontend adapter like `__main__.py`; the engine knows nothing about it. It owns `AI_FACTORIES` for the site (all six bot kinds, CLI key names), JSON serialization (`serialize_state` etc.; spectator view = `viewer_idx=None` shows every hand), and `BrowserSession` with a step API: `start()` / `bid(n)` / `reveal(color)` / `step()` (spectator) → view dict with `phase in {bid, reveal, ready, game_over}`.
+- **Snapshot-and-replay for reveals.** The engine is synchronous and the page can't block. The human's bid is preloaded before `play_round` (bids are simultaneous). If the human wins, `_BrowserHuman.choose_gem_to_reveal` raises `_NeedReveal`; the session had deep-copied `(state, rng)` before the round, so on `reveal(color)` it restores the snapshot and replays the round with the answer preloaded. Every AI's RNG/caches and the tie-break RNG live in the snapshot, so the replay is identical. `tests/test_browser.py::ReplayTest` pins this against a direct engine run; keep it passing if you touch the engine's round flow or add AI state outside the player object.
+- **Bot reasoning** (`explain=True`) calls each AI's `explain_bid` on a separate deep copy, so it can never perturb the game.
+- **Weights lookup** uses the uniform `candidate_filenames` chain, then falls back to the **4p** files (all checked-in weights are 4p), then class defaults. The site never errors on missing weights.
+- `web/build.py` stamps a content hash over `__MEGAGEM_BUILD__` in `.html`/`.js` for cache-busting. Use relative URLs everywhere: Pages serves the site under `/mega-gem/`.
 
 ### Engine layering (`megagem/`)
 
@@ -133,7 +120,7 @@ One unified package, four AI profiles, eight opponent modes. The CLI is `python 
 **Package layout** (under `research/scripts/evolve/`):
 
 - `profiles.py` — `AIProfile` dataclass + the registry of four profiles. Each profile only carries its `ai_class`, `num_weights`, and `mutation_sigma`/`mutation_clip`. Everything else is uniform: `flatten_defaults` lives as a classmethod on the AI class itself (the single source of truth for the genome layout — it's the inverse of `from_weights`), and the lookup chain is shared across all profiles via `opponents.candidate_filenames(profile_key, num_players)`. **Individual #0 of every GA run is loaded from `saved_best_weights/`** via that shared chain — the same chain used for opponents in `vs_all` / `vs_evoK` modes. That means each fresh run starts from the current champion instead of a hardcoded constant; re-running `python -m scripts.evolve --ai evo3` iteratively refines whatever weights are already checked in. If no file exists yet, the GA falls back to `profile.flatten_defaults()` → `ai_class.flatten_defaults()` (the class's hardcoded `DEFAULT_*` constants).
-- `opponents.py` — the eight uniform opponent modes (`vs_all`, `vs_random`, `vs_heuristic`, `vs_evo1`, `vs_evo2`, `vs_evo3`, `vs_evo4`, `self_play`), the `build_mode_providers` dispatcher, and the shared `candidate_filenames` lookup chain used by every profile and mirrored in `megagem/__main__.py` + `server/ai_factory.py`. `vs_all` returns Heuristic + every evo profile *except* the challenger's own (Random is intentionally excluded — every tuned bot trivially beats it and those free wins wash out the signal from harder opponents); `vs_evoK` loads frozen weights from `saved_best_weights/` via the shared chain.
+- `opponents.py` — the eight uniform opponent modes (`vs_all`, `vs_random`, `vs_heuristic`, `vs_evo1`, `vs_evo2`, `vs_evo3`, `vs_evo4`, `self_play`), the `build_mode_providers` dispatcher, and the shared `candidate_filenames` lookup chain used by every profile and mirrored in `megagem/__main__.py` + `megagem/browser.py`. `vs_all` returns Heuristic + every evo profile *except* the challenger's own (Random is intentionally excluded — every tuned bot trivially beats it and those free wins wash out the signal from harder opponents); `vs_evoK` loads frozen weights from `saved_best_weights/` via the shared chain.
 - `ga.py` — the GA loop, fitness evaluation, progress bar, plot/json output. Fully generic over `AIProfile`. One code path for every profile/mode combination.
 - `__main__.py` — argparse CLI. `--ai` is required; `--opponent` defaults to `vs_all`. Output files land in `artifacts/best_weights_{key}_{tag}_{N}p.json` and `artifacts/evolve_{key}_history_{tag}_{N}p.png`.
 
@@ -148,7 +135,7 @@ One unified package, four AI profiles, eight opponent modes. The CLI is `python 
 
 **vs_all is the default** for every profile. It pools win rate across Heuristic + every other evo class (loaded from `saved_best_weights/`, falling back to the AI class's `flatten_defaults()` classmethod). Random is intentionally excluded because every tuned bot beats it near-100%, so its slate would contribute near-perfect win rates that wash out the signal from the harder opponents. Each provider gets `len(CHARTS) × games_per_chart` games on a non-overlapping seed slice (offset by `prov_idx * 101`) so a challenger can't get lucky by hitting the same seed against every opponent.
 
-**Output filenames follow one uniform formula**: `best_weights_{profile_key}_{tag}_{num_players}p.json`, where `tag` is one of `vs_all`, `vs_random`, `vs_heuristic`, `vs_evo1..4`, `self`. The same formula drives the shared `candidate_filenames` lookup chain in `opponents.py`, which is mirrored byte-for-byte in `research/megagem/__main__.py` and `server/ai_factory.py`. There are no legacy filename fallbacks — the previously-checked-in `best_weights_4p.json` and `best_weights_evo2_vs_old_4p.json` were renamed to `best_weights_evo1_vs_heuristic_4p.json` and `best_weights_evo2_vs_evo1_4p.json` to fit the uniform scheme.
+**Output filenames follow one uniform formula**: `best_weights_{profile_key}_{tag}_{num_players}p.json`, where `tag` is one of `vs_all`, `vs_random`, `vs_heuristic`, `vs_evo1..4`, `self`. The same formula drives the shared `candidate_filenames` lookup chain in `opponents.py`, which is mirrored in `research/megagem/__main__.py` and `research/megagem/browser.py` (the latter adds a 4p fallback). There are no legacy filename fallbacks — the previously-checked-in `best_weights_4p.json` and `best_weights_evo2_vs_old_4p.json` were renamed to `best_weights_evo1_vs_heuristic_4p.json` and `best_weights_evo2_vs_evo1_4p.json` to fit the uniform scheme.
 
 ### Heatmap (`scripts/heatmap_pairwise.py`)
 
