@@ -3,9 +3,10 @@
 // All game logic runs in engine-worker.js (Pyodide + the canonical
 // research/megagem package). This file only renders the views that
 // megagem.browser.BrowserSession returns and sends back bids/reveals.
-// The EV coach (coach.js) is pure JS over those same views. Its only
-// engine call is `rival_bids`: the bots' own bids on random deals of the
-// cards the human can't see, run on a throwaway copy of the game.
+// The EV coach (coach.js) is pure JS over those same views and only uses
+// public information plus your hand. The one extra engine call,
+// `rival_bids` (the bots' own bids on random deals of the cards you can't
+// see), feeds the game log for the review, never the live coach.
 
 import { advise, analyze } from "./coach.js?v=__MEGAGEM_BUILD__";
 
@@ -160,7 +161,7 @@ function savePrefs() {
 
 const engine = new Engine();
 const prefs = loadPrefs();
-let game = null; // { config, view, token, busy, auto, autoTimer, log, snapshots, advice, sim, decisions, record }
+let game = null; // { config, view, token, busy, auto, autoTimer, log, snapshots, advice, decisions, record }
 let gameToken = 0;
 
 function showScreen(name) {
@@ -293,7 +294,7 @@ function renderEngineStatus(status, detail) {
 async function startGame(config) {
   stopAuto();
   const token = ++gameToken;
-  game = { config, view: null, token, busy: true, auto: false, autoTimer: null, log: [], snapshots: {}, advice: null, sim: null, decisions: {}, record: null };
+  game = { config, view: null, token, busy: true, auto: false, autoTimer: null, log: [], snapshots: {}, advice: null, decisions: {}, record: null };
   hideToast();
   $("g-log").innerHTML = "";
   showScreen("game");
@@ -655,7 +656,7 @@ function renderBid(el) {
     hint = `Your bid is a cost: the ${a.amount} you receive is repaid at the end. Worth it only if you need cash now.`;
   }
   const quick = [...new Set([0, 1, Math.round(max / 4), Math.round(max / 2), max])].filter((v) => v <= max);
-  const adv = prefs.coach && coachReady(view) ? adviceFor(view) : null;
+  const adv = prefs.coach ? adviceFor(view) : null;
   const coachQuick = adv ? `<button type="button" class="btn sm coach-q" data-q="${adv.suggested}" title="EV coach suggestion">Coach ${adv.suggested}</button>` : "";
   el.classList.add("live");
   el.innerHTML = `<h3>Your sealed bid</h3>
@@ -713,39 +714,37 @@ const VERDICTS = { buy: ["Buy", "pos"], thin: ["Thin margin", "warn"], shot: ["L
 
 let setBid = null; // renderBid's setter, so the coach can fill the bid box
 
+// For the game log only: what the bots would have bid on random deals of
+// the cards you couldn't see, so the review can set the coach's guess and
+// your bid against the bots' real bidding. The live coach never sees it.
 const RIVAL_SAMPLES = 200;
-const simFor = (view) => (game.sim?.view === view ? game.sim : null);
-const coachReady = (view) => !!simFor(view) && !simFor(view).pending;
 
-// Ask the engine what the bots would bid on random deals of the cards you
-// can't see. Until it answers, the coach shows a placeholder; if it fails,
-// the coach falls back to its own rival model. Runs on every human bid,
-// coach shown or not, so the game log keeps the coach's view of each one.
 function requestSim(view) {
-  if (view.phase !== "bid" || view.human_idx === null || simFor(view)) return;
-  const sim = (game.sim = { view, pending: true, data: null });
-  game.decisions[view.state.round_number + 1] = { view, sim, coachShown: prefs.coach };
+  const round = view.state.round_number + 1;
+  if (view.phase !== "bid" || view.human_idx === null || game.decisions[round]) return;
+  const d = (game.decisions[round] = { view, sim: null, coachShown: prefs.coach });
   engine.call("rival_bids", { samples: RIVAL_SAMPLES })
-    .then((data) => { sim.data = data; })
-    .catch((err) => console.error("Rival sampling failed; using the coach's model:", err))
-    .finally(() => {
-      sim.pending = false;
-      if (game?.sim !== sim || game.view !== view || game.busy) return;
-      const typed = $("bid-num")?.value; // keep a half-entered bid across the re-render
-      renderAction();
-      if (typed !== undefined) setBid?.(typed);
-      renderCoach();
-    });
+    .then((data) => { d.sim = data; })
+    .catch((err) => console.error("Rival sampling for the game log failed:", err));
 }
 
-// One advise() per view (and per sample set). The coach is an add-on: if it
-// throws, log it and carry on without it rather than breaking the game.
+// Each bot's bid over the sampled deals: 10th percentile, median, 90th.
+function botRanges(sim) {
+  if (!sim?.samples?.length) return null;
+  return sim.seats.map((seat, k) => {
+    const xs = sim.samples.map((s) => s[k]).sort((a, b) => a - b);
+    const q = (f) => xs[Math.min(xs.length - 1, Math.floor(f * xs.length))];
+    return { idx: seat, low: q(0.1), mid: q(0.5), high: q(0.9) };
+  });
+}
+
+// One advise() per view. The coach is an add-on: if it throws, log it and
+// carry on without it rather than breaking the game.
 function adviceFor(view) {
-  const sim = simFor(view);
-  if (game.advice?.view !== view || game.advice.sim !== sim?.data) {
+  if (game.advice?.view !== view) {
     let adv = null;
-    try { adv = advise(view, sim?.data ?? null); } catch (err) { console.error("EV coach failed:", err); }
-    game.advice = { view, sim: sim?.data, adv };
+    try { adv = advise(view); } catch (err) { console.error("EV coach failed:", err); }
+    game.advice = { view, adv };
   }
   return game.advice.adv;
 }
@@ -771,14 +770,7 @@ function renderCoach() {
   btn.textContent = prefs.coach ? "Coach: on" : "Coach: off";
   const el = $("g-coach");
   el.classList.remove("stale");
-  const wanted = prefs.coach && view.human_idx !== null && view.phase === "bid";
-  if (wanted && !coachReady(view)) {
-    requestSim(view);
-    el.hidden = false;
-    $("g-coach-body").innerHTML = `<div class="waiting"><span class="spinner"></span>Running the bots' bidding on ${RIVAL_SAMPLES} deals of the cards you can't see…</div>`;
-    return;
-  }
-  const adv = wanted ? adviceFor(view) : null;
+  const adv = prefs.coach && view.human_idx !== null && view.phase === "bid" ? adviceFor(view) : null;
   el.hidden = !adv;
   if (!adv) return;
 
@@ -1062,11 +1054,11 @@ function recordRound(result) {
   const d = game.decisions[result.round];
   const entry = { round: result.round, state: game.snapshots[result.round] ?? null, result };
   if (d) {
-    // The rival sample for this bid always lands before the bid's result
-    // (the worker answers in order), so this is the advice as shown.
+    // The worker answers in order, so this bid's rival sample has always
+    // landed by the time its result does.
     let adv = null;
-    try { adv = advise(d.view, d.sim?.data ?? null); } catch (err) { console.error("EV coach failed:", err); }
-    Object.assign(entry, { max_bid: d.view.max_bid, coachShown: d.coachShown, advice: adv && trimAdvice(adv) });
+    try { adv = advise(d.view); } catch (err) { console.error("EV coach failed:", err); }
+    Object.assign(entry, { max_bid: d.view.max_bid, coachShown: d.coachShown, advice: adv && trimAdvice(adv), bots: botRanges(d.sim) });
     delete game.decisions[result.round];
   }
   game.record.rounds.push(entry);
@@ -1205,6 +1197,7 @@ function normalizeRecord(raw) {
     rounds: raw.rounds.map((e) => ({
       round: int(e?.round), state: cleanState(e?.state), result: cleanResult(e?.result),
       max_bid: e?.max_bid == null ? null : int(e.max_bid), coachShown: e?.coachShown == null ? null : !!e.coachShown, advice: cleanAdvice(e?.advice),
+      bots: Array.isArray(e?.bots) ? e.bots.map((b) => ({ idx: int(b?.idx), low: int(b?.low), mid: int(b?.mid), high: int(b?.high) })) : null,
     })),
     end: raw.end ? {
       state: cleanState(raw.end.state),
@@ -1349,12 +1342,19 @@ function reviewRound(i) {
         : adv.kind === "invest" ? tile("A win paid", `+${adv.fair}`, "Invest bonus") : tile("Coin value", `${adv.cashValue.toFixed(1)}×`, "What a coin was worth in later lots at the time"),
       adv.winProb !== null && adv.suggested > 0 ? tile("Coach's win chance", `${Math.round(adv.winProb * 100)}%`, "At the coach's bid") : "",
     ].join("");
-    const rivals = adv.rivals.length ? `<div class="coach-table-wrap"><table class="coach-table">
-        <thead><tr><th>Rival</th><th>${adv.rivalSource === "bots" ? "Bots' range" : "Coach expected"}</th><th>Actual bid</th>${showHands ? "<th>Hand then</th>" : ""}</tr></thead>
-        <tbody>${adv.rivals.map((x) => `<tr><td><b>${seatName(rec, x.idx)}</b></td>
-          <td>${x.low !== null && x.low !== x.high ? `${x.low}–${x.high}` : `~${x.likely}`}</td>
-          <td class="${r.bids[x.idx] > (x.high ?? x.likely) ? "neg" : r.bids[x.idx] < (x.low ?? x.likely) ? "pos" : ""}">${r.bids[x.idx]}</td>
-          ${showHands ? `<td><span class="gem-row">${gemList(an.hands[x.idx] || [], "sm")}</span></td>` : ""}</tr>`).join("")}</tbody></table></div>` : "";
+    const range = (lo, mid, hi) => (lo !== null && lo !== undefined && lo !== hi ? `${lo}–${hi}` : `~${mid}`);
+    const bots = new Map((e.bots || []).map((b) => [b.idx, b]));
+    const rivals = adv.rivals.length || bots.size ? `<div class="coach-table-wrap"><table class="coach-table">
+        <thead><tr><th>Rival</th>${adv.rivals.length ? `<th title="What the coach expected at the time">Coach guessed</th>` : ""}${bots.size ? `<th title="The bot's own bidding on 200 random deals of the cards you couldn't see">Bot's real range</th>` : ""}<th>Actual bid</th>${showHands ? "<th>Hand then</th>" : ""}</tr></thead>
+        <tbody>${rec.seats.map((_, k) => k).filter((k) => k !== me).map((k) => {
+          const g = adv.rivals.find((x) => x.idx === k), b = bots.get(k);
+          return `<tr><td><b>${seatName(rec, k)}</b></td>
+            ${adv.rivals.length ? `<td>${g ? range(g.low, g.likely, g.high) : "—"}</td>` : ""}
+            ${bots.size ? `<td>${b ? range(b.low, b.mid, b.high) : "—"}</td>` : ""}
+            <td>${r.bids[k]}</td>
+            ${showHands ? `<td><span class="gem-row">${gemList(an.hands[k] || [], "sm")}</span></td>` : ""}</tr>`;
+        }).join("")}</tbody></table></div>
+        ${bots.size ? `<p class="muted small">"Bot's real range" is each bot's own bidding on 200 random deals of the cards you couldn't see: hindsight the coach didn't have.</p>` : ""}` : "";
     parts.push(`<section class="panel rv-you">
         <div class="panel-title">Your decision ${e.coachShown === false ? "<span>the coach was hidden at the time</span>" : ""}</div>
         <div class="ctiles">${tiles}</div>
