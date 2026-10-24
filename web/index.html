@@ -39,9 +39,10 @@
                         <div class="seg" id="mode-seg" role="group" aria-label="Mode">
                             <button type="button" data-value="play" aria-pressed="true">Play</button>
                             <button type="button" data-value="watch" aria-pressed="false">Watch bots</button>
+                            <button type="button" data-value="online" aria-pressed="false">Online</button>
                         </div>
                     </div>
-                    <div class="field">
+                    <div class="field" id="players-field">
                         <span>Players</span>
                         <div class="seg" id="players-seg" role="group" aria-label="Number of players">
                             <button type="button" data-value="3" aria-pressed="false">3</button>
@@ -55,7 +56,24 @@
                     </label>
                 </div>
 
-                <div class="field">
+                <div id="online-field" class="online-box" hidden>
+                    <div class="online-card">
+                        <h3>Host a game</h3>
+                        <p class="muted small">You get a code to share. In the lobby you add bots, pick the chart and the time limit, and start when everyone's in.</p>
+                        <button id="online-host" type="button" class="btn primary">Host a game</button>
+                    </div>
+                    <div class="online-card">
+                        <h3>Join a game</h3>
+                        <p class="muted small">Enter the 5-letter code the host gives you.</p>
+                        <div class="join-row">
+                            <input id="online-code" type="text" maxlength="5" placeholder="CODE" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="Room code">
+                            <button id="online-join" type="button" class="btn">Join</button>
+                        </div>
+                    </div>
+                    <p class="muted small online-note">Browsers connect directly to each other (WebRTC, introduced by PeerJS's free public server). The host's browser runs the game, so the host keeps their tab open. Some strict school or office networks block direct connections.</p>
+                </div>
+
+                <div class="field" id="seats-field">
                     <span style="display:flex;justify-content:space-between;gap:8px;align-items:center">
                         Seats
                         <select id="setup-all" style="width:auto;font-size:13px;padding:5px 8px" aria-label="Set every bot to">
@@ -65,12 +83,22 @@
                     <div id="seat-list" class="seat-list"></div>
                 </div>
 
-                <div class="field">
+                <div class="field" id="chart-field">
                     <span>Value chart: what each collected gem is worth for 0–5+ of its colour in the Value Display</span>
                     <div id="chart-picker" class="chart-picker" role="group" aria-label="Value chart"></div>
                 </div>
 
-                <div class="setup-row">
+                <div class="setup-row" id="options-row">
+                    <div class="field" id="time-field">
+                        <span>Move time limit</span>
+                        <div class="seg" id="time-seg" role="group" aria-label="Move time limit">
+                            <button type="button" data-value="0">Off</button>
+                            <button type="button" data-value="15">15s</button>
+                            <button type="button" data-value="30">30s</button>
+                            <button type="button" data-value="60">1 min</button>
+                            <button type="button" data-value="120">2 min</button>
+                        </div>
+                    </div>
                     <label class="field">
                         <span>Seed (blank = random)</span>
                         <input id="setup-seed" type="number" min="0" placeholder="random">
@@ -85,7 +113,7 @@
                     </label>
                 </div>
 
-                <div class="start-bar">
+                <div class="start-bar" id="start-bar">
                     <span id="engine-status" class="engine-status"><i class="dot"></i><span>Starting the Python engine…</span></span>
                     <button id="setup-start" type="submit" class="btn primary lg">Deal the cards</button>
                 </div>
@@ -123,6 +151,7 @@
                 <div class="progress" aria-hidden="true"><i id="g-progress" style="width:0%"></i></div>
             </div>
             <div class="game-meta" id="g-meta"></div>
+            <span id="g-timer" class="timer-chip" hidden></span>
             <button id="g-coach-btn" type="button" class="btn sm ghost coach-toggle" aria-pressed="true" hidden>Coach: on</button>
         </div>
 
@@ -230,9 +259,57 @@
                 <button id="end-download" class="btn lg" type="button">Download game log</button>
             </div>
             <div class="end-actions">
+                <button id="end-lobby" class="btn primary lg" type="button" hidden>Back to the lobby</button>
                 <button id="end-rematch" class="btn primary lg" type="button">Rematch (same seed)</button>
                 <button id="end-again" class="btn lg" type="button">New deal</button>
                 <button id="end-setup" class="btn ghost lg" type="button">Change settings</button>
+            </div>
+        </div>
+    </main>
+
+    <!-- ============================ LOBBY ============================ -->
+    <main id="screen-lobby" class="wrap" hidden>
+        <div class="lobby">
+            <div class="lobby-head panel">
+                <div>
+                    <span class="muted small">Room code</span>
+                    <div id="lb-code" class="room-code">-----</div>
+                    <p id="lb-hint" class="muted small" style="margin:0"></p>
+                </div>
+                <button id="lb-copy" class="btn sm" type="button">Copy code</button>
+            </div>
+            <section class="panel">
+                <div class="panel-title">Players <span id="lb-count"></span></div>
+                <div id="lb-players" class="lb-players"></div>
+                <div id="lb-bots" class="lb-bots">
+                    <select id="lb-bot-kind" aria-label="Bot to add"></select>
+                    <button id="lb-add-bot" class="btn sm" type="button">Add a bot</button>
+                </div>
+            </section>
+            <section class="panel lb-settings">
+                <div class="panel-title">Settings <span id="lb-settings-note"></span></div>
+                <div class="field">
+                    <span>Value chart</span>
+                    <div id="lb-chart" class="chart-picker" role="group" aria-label="Value chart"></div>
+                </div>
+                <div class="setup-row">
+                    <div class="field">
+                        <span>Move time limit</span>
+                        <div class="seg" id="lb-time" role="group" aria-label="Move time limit">
+                            <button type="button" data-value="0">Off</button>
+                            <button type="button" data-value="15">15s</button>
+                            <button type="button" data-value="30">30s</button>
+                            <button type="button" data-value="60">1 min</button>
+                            <button type="button" data-value="120">2 min</button>
+                        </div>
+                    </div>
+                    <label class="check"><input id="lb-coach" type="checkbox"> Allow the EV coach</label>
+                </div>
+            </section>
+            <div class="lobby-actions">
+                <span id="lb-status" class="muted small"></span>
+                <button id="lb-leave" class="btn ghost lg" type="button">Leave</button>
+                <button id="lb-start" class="btn primary lg" type="button">Start the game</button>
             </div>
         </div>
     </main>

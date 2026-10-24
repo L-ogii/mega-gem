@@ -42,6 +42,14 @@ def megagem_call(cmd, args_json):
         return json.dumps(_session.view())
     if cmd == "rival_bids":
         return json.dumps(_session.rival_bids(int(args.get("samples", 200))))
+    # Online play: the host's session has a seat per human player.
+    if cmd == "views":
+        return json.dumps(_session.views())
+    if cmd == "bid_all":
+        return json.dumps(_session.bid_all(args["bids"]))
+    if cmd == "reveal_seat":
+        _session.reveal(args["color"], int(args["seat"]))
+        return json.dumps(_session.views())
     raise ValueError(f"Unknown command: {cmd!r}")
 `;
 

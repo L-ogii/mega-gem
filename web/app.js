@@ -9,6 +9,7 @@
 // see), feeds the game log for the review, never the live coach.
 
 import { advise, analyze } from "./coach.js?v=__MEGAGEM_BUILD__";
+import { CODE_LENGTH, cleanCode, hostRoom, joinRoom } from "./online.js?v=__MEGAGEM_BUILD__";
 
 const COLORS = ["Blue", "Green", "Pink", "Purple", "Yellow"];
 const COLOR_HEX = { Blue: "#4f9bff", Green: "#33d68b", Pink: "#ff5fae", Purple: "#a875ff", Yellow: "#ffcc3d" };
@@ -142,7 +143,10 @@ class Engine {
 // --------------------------------------------------------------------------
 
 const PREFS_KEY = "megagem.prefs.v2";
-const defaultPrefs = { mode: "play", players: 4, name: "", chart: "A", explain: false, coach: true, coachColors: true, reviewHands: false, bots: ["evo4", "evo4", "evo4", "evo4", "evo4"] };
+const defaultPrefs = {
+  mode: "play", players: 4, name: "", chart: "A", explain: false, coach: true, coachColors: true, reviewHands: false, timeLimit: 0,
+  bots: ["evo4", "evo4", "evo4", "evo4", "evo4"], onlineBots: ["evo4", "evo4"], onlineTime: 30, onlineCoach: true,
+};
 
 function loadPrefs() {
   try {
@@ -161,11 +165,11 @@ function savePrefs() {
 
 const engine = new Engine();
 const prefs = loadPrefs();
-let game = null; // { config, view, token, busy, auto, autoTimer, log, snapshots, advice, decisions, record }
+let game = null; // { config, view, token, busy, auto, autoTimer, log, snapshots, advice, decisions, record, driver, online, waiting, deadline }
 let gameToken = 0;
 
 function showScreen(name) {
-  for (const s of ["setup", "game", "end", "review"]) $(`screen-${s}`).hidden = s !== name;
+  for (const s of ["setup", "game", "end", "review", "lobby"]) $(`screen-${s}`).hidden = s !== name;
   $("nav-quit").hidden = name !== "game";
   if (name === "setup") renderPastGames();
   window.scrollTo({ top: 0 });
@@ -204,8 +208,13 @@ function botOptions(selected) {
 function renderSetup() {
   seg("mode-seg", prefs.mode, (v) => { prefs.mode = v; savePrefs(); renderSetup(); });
   seg("players-seg", prefs.players, (v) => { prefs.players = Number(v); savePrefs(); renderSetup(); });
-  $("name-field").hidden = prefs.mode !== "play";
+  const isOnline = prefs.mode === "online";
+  $("name-field").hidden = prefs.mode === "watch";
   $("coach-field").hidden = prefs.mode !== "play";
+  for (const id of ["players-field", "seats-field", "chart-field", "options-row", "setup-start"]) $(id).hidden = isOnline;
+  $("online-field").hidden = !isOnline;
+  $("time-field").hidden = prefs.mode !== "play";
+  seg("time-seg", prefs.timeLimit, (v) => { prefs.timeLimit = Number(v); savePrefs(); renderSetup(); });
   $("setup-name").value = prefs.name;
   $("setup-explain").checked = prefs.explain;
   $("setup-coach").checked = prefs.coach;
@@ -274,8 +283,12 @@ function wireSetup() {
   });
   $("setup-form").addEventListener("submit", (e) => {
     e.preventDefault();
-    startGame(setupConfig());
+    if (prefs.mode === "online") joinOnline($("online-code").value);
+    else startGame(setupConfig());
   });
+  $("online-host").onclick = startHosting;
+  $("online-join").onclick = () => joinOnline($("online-code").value);
+  $("online-code").addEventListener("input", (e) => { e.target.value = cleanCode(e.target.value); });
   $("hero-gems").innerHTML = COLORS.map((c) => gem(c, "lg")).join("");
 }
 
@@ -285,16 +298,22 @@ function renderEngineStatus(status, detail) {
   el.querySelector("span").textContent = detail || "";
   $("setup-start").textContent = status === "ready" ? "Deal the cards" : status === "error" ? "Engine failed to load" : "Deal the cards (loading…)";
   $("setup-start").disabled = status === "error";
+  if (online?.role === "host" && !online.game && !$("screen-lobby").hidden) syncLobby();
 }
 
 // --------------------------------------------------------------------------
 // Game flow
 // --------------------------------------------------------------------------
 
+// Who runs the game: this browser's engine, or the online table (see the
+// Online section). Online drivers return nothing: the next view arrives
+// when every player has moved.
+const localDriver = { local: true, send: (cmd, args) => engine.call(cmd, args) };
+
 async function startGame(config) {
   stopAuto();
   const token = ++gameToken;
-  game = { config, view: null, token, busy: true, auto: false, autoTimer: null, log: [], snapshots: {}, advice: null, decisions: {}, record: null };
+  game = { config, view: null, token, busy: true, auto: false, autoTimer: null, log: [], snapshots: {}, advice: null, decisions: {}, record: null, driver: localDriver };
   hideToast();
   $("g-log").innerHTML = "";
   showScreen("game");
@@ -318,14 +337,14 @@ async function act(cmd, args) {
   game.busy = true;
   if (cmd === "bid") {
     const d = game.decisions[game.view.state.round_number + 1];
-    if (d) d.coachShown = prefs.coach;
+    if (d) d.coachShown = coachOn();
   }
   renderAction();
   $("g-coach").classList.add("stale");
   try {
-    const view = await engine.call(cmd, args);
+    const view = await game.driver.send(cmd, args);
     if (token !== gameToken) return;
-    handleView(view);
+    if (view) handleView(view);
   } catch (err) {
     if (token !== gameToken) return;
     game.busy = false;
@@ -335,9 +354,11 @@ async function act(cmd, args) {
   }
 }
 
-function handleView(view) {
+function handleView(view, clock = null) {
   game.view = view;
   game.busy = false;
+  game.record ??= newRecord(game.config, view);
+  setClock(view, clock);
   // The table as seen at bid time, keyed by the round about to be played,
   // so the end-screen analysis can value each lot from every seat.
   if (view.phase === "bid" || view.phase === "ready") game.snapshots[view.state.round_number + 1] = structuredClone(view.state);
@@ -362,8 +383,10 @@ function handleView(view) {
 }
 
 function quitGame() {
+  if (game?.online) return quitOnlineGame();
   if (game && game.view && game.view.phase !== "game_over" && !confirm("Abandon this game?")) return;
   stopAuto();
+  stopClock();
   gameToken++;
   game = null;
   showScreen("setup");
@@ -397,7 +420,8 @@ const chartValue = (chart, n) => CHARTS[chart].values[Math.min(Math.max(n, 0), 5
 
 function seatLabel(view, i) {
   const kind = view.seat_kinds[i];
-  return kind === "human" ? "You" : (BOT_BY_KIND[kind]?.label || kind);
+  if (kind === "human") return i === view.human_idx ? "You" : "Player";
+  return BOT_BY_KIND[kind]?.label || kind;
 }
 
 function scoreNow(state, ps) {
@@ -456,7 +480,7 @@ function renderLoadingTable() {
   $("g-meta").innerHTML = "";
   $("g-opponents").innerHTML = "";
   $("g-auction").className = "auction";
-  $("g-auction").innerHTML = `<div class="waiting"><span class="spinner"></span><span>${esc(engine.status === "ready" ? "Shuffling…" : engine.detail || "Loading the engine…")}</span></div>`;
+  $("g-auction").innerHTML = `<div class="waiting"><span class="spinner"></span><span>${esc(game?.online ? "Waiting for the host to deal…" : engine.status === "ready" ? "Shuffling…" : engine.detail || "Loading the engine…")}</span></div>`;
   $("g-market").innerHTML = "";
   $("g-chart-track").innerHTML = "";
   $("g-missions").innerHTML = "";
@@ -514,7 +538,7 @@ function renderSeats() {
     return `<article class="seat-card${winner ? " winner" : ""}${isYou ? " you" : ""}">
       ${last ? `<span class="last-bid">${winner ? "won · " : ""}bid ${last.bids[i]}</span>` : ""}
       <div class="seat-card-head">
-        <div class="who"><b>${esc(ps.name)}</b>${isYou ? '<span class="chip">You</span>' : `<span class="chip kind" title="${esc(bot?.tier || "")}">${esc(bot?.label || kind)}</span>`}</div>
+        <div class="who"><b>${esc(ps.name)}</b>${isYou ? '<span class="chip">You</span>' : kind === "human" ? '<span class="chip human">Player</span>' : `<span class="chip kind" title="${esc(bot?.tier || "")}">${esc(bot?.label || kind)}</span>`}</div>
         ${coin(ps.coins)}
       </div>
       <div class="stats"><span>Hand</span>${hand}</div>
@@ -536,16 +560,19 @@ function renderAuction() {
     return;
   }
   el.className = `auction ${a.kind}`;
-  const won = view.phase === "reveal" ? `<span class="chip mission">You won this auction</span>` : "";
+  // While the winner picks a gem to reveal, the lot is already theirs.
+  const settled = view.phase === "reveal" || view.phase === "waiting";
+  const winner = view.phase === "waiting" ? esc(st.players[view.reveal_seat]?.name ?? "The winner") : null;
+  const won = view.phase === "reveal" ? `<span class="chip mission">You won this auction</span>`
+    : winner ? `<span class="chip mission">${winner} won this auction</span>` : "";
   let body = "";
   if (a.kind === "treasure") {
-    // In the reveal phase the gems have already moved into your collection.
-    const offered = view.phase === "reveal" ? [] : st.revealed_gems;
+    const offered = settled ? [] : st.revealed_gems;
     const slots = offered.map((c, i) => `<span class="slot${i < a.gems ? "" : " off"}" title="${i < a.gems ? "Goes to the winner" : "Stays face-up"}">${gem(c, "xl")}</span>`).join("");
     const value = offered.slice(0, a.gems).reduce((s, c) => s + chartValue(st.value_chart, st.value_display[c] || 0), 0);
     body = `<div class="auction-title">Treasure ×${a.gems}</div>
-      ${view.phase === "reveal" ? "" : `<div class="auction-gems">${slots || '<span class="empty">no gems left</span>'}</div>`}
-      <div class="auction-sub">${view.phase === "reveal" ? "The gems are in your collection." : `Winner takes the highlighted gem${a.gems > 1 ? "s" : ""}. Worth ${coin(value)} at today's display.`}</div>`;
+      ${settled ? "" : `<div class="auction-gems">${slots || '<span class="empty">no gems left</span>'}</div>`}
+      <div class="auction-sub">${settled ? `The gems are in ${winner ? `${winner}'s` : "your"} collection.` : `Winner takes the highlighted gem${a.gems > 1 ? "s" : ""}. Worth ${coin(value)} at today's display.`}</div>`;
   } else if (a.kind === "loan") {
     body = `<div class="auction-title">Loan ${coin(a.amount)}</div>
       <div class="auction-sub">Winner pays their bid, receives ${a.amount} now and repays ${a.amount} at game end. You may bid up to your coins + ${a.amount}.</div>`;
@@ -554,7 +581,7 @@ function renderAuction() {
       <div class="auction-sub">Winner's bid is locked away and paid back at game end with a +${a.amount} bonus.</div>`;
   }
   el.innerHTML = `<div class="auction-kind">${a.kind}</div>${won}${body}
-    <div class="auction-deck">${st.auction_deck_count - (view.phase === "reveal" ? 0 : 1)} more auction cards after this</div>`;
+    <div class="auction-deck">${st.auction_deck_count - (settled ? 0 : 1)} more auction cards after this</div>`;
 }
 
 function renderMarket(el, st, me, { final = false } = {}) {
@@ -631,12 +658,20 @@ function renderAction() {
     $("sp-step").disabled = game.busy || view.phase !== "ready";
     return;
   }
+  const names = (xs) => xs.map(esc).join(", ").replace(/, ([^,]*)$/, " and $1");
   if (game.busy) {
-    el.innerHTML = `<div class="waiting"><span class="spinner"></span>Bots are bidding…</div>`;
+    const others = (game.waiting || []).filter((n) => n !== view.state.players[view.human_idx]?.name);
+    el.innerHTML = `<div class="waiting"><span class="spinner"></span>${game.online
+      ? others.length ? `Waiting for ${names(others)}…` : "Playing the round…"
+      : "Bots are bidding…"}</div>`;
     return;
   }
   if (view.phase === "bid") return renderBid(el);
   if (view.phase === "reveal") return renderReveal(el);
+  if (view.phase === "waiting") {
+    el.innerHTML = `<div class="waiting"><span class="spinner"></span>Waiting for ${esc(view.state.players[view.reveal_seat]?.name ?? "the winner")} to reveal a gem…</div>`;
+    return;
+  }
   el.innerHTML = `<div class="waiting">Game over: tallying scores…</div>`;
 }
 
@@ -656,7 +691,7 @@ function renderBid(el) {
     hint = `Your bid is a cost: the ${a.amount} you receive is repaid at the end. Worth it only if you need cash now.`;
   }
   const quick = [...new Set([0, 1, Math.round(max / 4), Math.round(max / 2), max])].filter((v) => v <= max);
-  const adv = prefs.coach ? adviceFor(view) : null;
+  const adv = coachOn() ? adviceFor(view) : null;
   const coachQuick = adv ? `<button type="button" class="btn sm coach-q" data-q="${adv.suggested}" title="EV coach suggestion">Coach ${adv.suggested}</button>` : "";
   el.classList.add("live");
   el.innerHTML = `<h3>Your sealed bid</h3>
@@ -722,7 +757,8 @@ const RIVAL_SAMPLES = 200;
 function requestSim(view) {
   const round = view.state.round_number + 1;
   if (view.phase !== "bid" || view.human_idx === null || game.decisions[round]) return;
-  const d = (game.decisions[round] = { view, sim: null, coachShown: prefs.coach });
+  const d = (game.decisions[round] = { view, sim: null, coachShown: coachOn() });
+  if (!game.driver.local) return; // online: no bots to sample from this seat's engine
   engine.call("rival_bids", { samples: RIVAL_SAMPLES })
     .then((data) => { d.sim = data; })
     .catch((err) => console.error("Rival sampling for the game log failed:", err));
@@ -749,6 +785,9 @@ function adviceFor(view) {
   return game.advice.adv;
 }
 
+const coachAllowed = () => !game?.online || game.config.settings.coach;
+const coachOn = () => prefs.coach && coachAllowed();
+
 function toggleCoach() {
   prefs.coach = !prefs.coach;
   savePrefs();
@@ -765,12 +804,12 @@ const tieText = (t) => (t === true ? "you win" : t === false ? "they win" : "ran
 function renderCoach() {
   const { view } = game;
   const btn = $("g-coach-btn");
-  btn.hidden = view.human_idx === null;
+  btn.hidden = view.human_idx === null || !coachAllowed();
   btn.setAttribute("aria-pressed", String(prefs.coach));
   btn.textContent = prefs.coach ? "Coach: on" : "Coach: off";
   const el = $("g-coach");
   el.classList.remove("stale");
-  const adv = prefs.coach && view.human_idx !== null && view.phase === "bid" ? adviceFor(view) : null;
+  const adv = coachOn() && view.human_idx !== null && view.phase === "bid" ? adviceFor(view) : null;
   el.hidden = !adv;
   if (!adv) return;
 
@@ -935,8 +974,17 @@ function renderEnd() {
   }
   hideToast();
   showScreen("end");
+  const isOnline = !!game.online;
+  $("end-rematch").hidden = $("end-again").hidden = isOnline;
+  $("end-lobby").hidden = !isOnline;
+  $("end-setup").textContent = isOnline ? "Leave the room" : "Change settings";
   $("end-rematch").onclick = () => startGame({ ...config });
   $("end-again").onclick = () => startGame({ ...config, seed: null });
+  $("end-lobby").onclick = () => {
+    if (online?.role === "host") return hostBackToLobby();
+    game = null;
+    showLobby();
+  };
   const rec = game.record;
   $("end-review").onclick = () => openReview(normalizeRecord(rec), "end");
   $("end-download").onclick = () => downloadRecord(rec);
@@ -1020,6 +1068,553 @@ function renderAnalysis() {
 
   $("end-analysis").innerHTML = parts.join("");
 }
+
+// --------------------------------------------------------------------------
+// Move clock: a countdown on your move when a time limit is on. Single
+// player sets it here; online, the host sends it (and the host's clock is
+// the one that counts). When it runs out the move is made for you: the
+// bid is whatever is in the box, and a reveal shows your first gem.
+// --------------------------------------------------------------------------
+
+let clockTimer = null;
+
+function setClock(view, clock) {
+  const yourMove = view.phase === "bid" || view.phase === "reveal";
+  const total = game.driver.local ? prefs.timeLimit * 1000 : clock?.total ?? 0;
+  const left = game.driver.local ? total : clock?.msLeft ?? 0;
+  game.deadline = yourMove && total > 0 && view.human_idx !== null ? Date.now() + left : null;
+  clearInterval(clockTimer);
+  clockTimer = game.deadline ? setInterval(tickClock, 250) : null;
+  tickClock();
+}
+
+function stopClock() {
+  clearInterval(clockTimer);
+  clockTimer = null;
+  $("g-timer").hidden = true;
+}
+
+function tickClock() {
+  const el = $("g-timer");
+  if (!game?.deadline || game.busy) { el.hidden = true; return; }
+  const left = Math.max(0, game.deadline - Date.now());
+  const secs = Math.ceil(left / 1000);
+  el.hidden = false;
+  el.textContent = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")} left`;
+  el.classList.toggle("urgent", left < 5000);
+  if (left > 0) return;
+  game.deadline = null;
+  stopClock();
+  const { view } = game;
+  if (view.phase === "bid") {
+    const amount = Math.max(0, Math.min(view.max_bid ?? 0, Math.round(Number($("bid-num")?.value) || 0)));
+    toast(`Time's up: your bid of ${amount} went in.`);
+    act("bid", { amount });
+  } else if (view.phase === "reveal") {
+    const color = view.state.players[view.human_idx].hand?.[0];
+    if (color) { toast(`Time's up: ${gem(color, "sm")} was revealed for you.`); act("reveal", { color }); }
+  }
+}
+
+// --------------------------------------------------------------------------
+// Online play (connections in online.js)
+//
+// The host's browser runs the only engine. It collects every human's move,
+// plays the round, and sends each player the view from their own seat, so
+// no player's browser ever holds anyone else's hand. Players render those
+// views with the same screens as single player.
+// --------------------------------------------------------------------------
+
+const MIN_SEATS = 3, MAX_SEATS = 5;
+const GRACE_MS = 1500; // the host waits this long past a deadline for moves still in flight
+let online = null; // { role: "host" | "guest", room, code, members?, game?, lobby?, seat? }
+let tokenFallback = null;
+
+// Identifies you to the host, so a dropped connection gets your seat back.
+// (getRandomValues, unlike randomUUID, works on plain-http LAN addresses too.)
+const randomToken = () => [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
+function onlineToken() {
+  try {
+    let t = sessionStorage.getItem("megagem.online.token");
+    if (!t) sessionStorage.setItem("megagem.online.token", (t = randomToken()));
+    return t;
+  } catch (_) {
+    return (tokenFallback ??= randomToken());
+  }
+}
+
+const playerName = () => (prefs.name || "").trim().slice(0, 20) || "Player";
+
+function beginOnlineGame(driver, settings) {
+  stopAuto();
+  game = {
+    config: { online: true, settings }, view: null, token: ++gameToken, busy: true, auto: false, autoTimer: null,
+    log: [], snapshots: {}, advice: null, decisions: {}, record: null, driver, online: true, waiting: [],
+  };
+  hideToast();
+  $("g-log").innerHTML = "";
+  showScreen("game");
+  renderLoadingTable();
+}
+
+function showLobby() {
+  showScreen("lobby");
+  if (online?.role === "host") syncLobby();
+  else if (online?.lobby) renderLobby(online.lobby);
+}
+
+function leaveOnline() {
+  if (!online) return;
+  const { role, room } = online;
+  clearTimeout(online.game?.pending?.timer);
+  online = null;
+  if (role === "host") {
+    room.broadcast({ t: "closed", reason: "The host closed the room." });
+    setTimeout(() => room.close(), 300);
+  } else {
+    room.send({ t: "leave" });
+    room.close();
+  }
+}
+
+function quitOnlineGame() {
+  const host = online?.role === "host";
+  if (game.view?.phase !== "game_over" && !confirm(host ? "End this game for everyone and go back to the lobby?" : "Leave this game? Your moves will be made for you until you rejoin.")) return;
+  stopClock();
+  if (host) return hostBackToLobby();
+  leaveOnline();
+  gameToken++;
+  game = null;
+  showScreen("setup");
+}
+
+// Lobby (both sides) -------------------------------------------------------
+
+function renderLobby(state) {
+  const host = online?.role === "host";
+  const n = state.players.length;
+  $("lb-code").textContent = state.code;
+  $("lb-hint").textContent = host
+    ? "Share this code. Players open this site, choose Online, then Join a game."
+    : "You're in. The host picks the settings and starts the game.";
+  $("lb-count").textContent = `${n} of ${MAX_SEATS} seats`;
+  $("lb-players").innerHTML = state.players.map((p, i) => {
+    const role = p.role === "host" ? "Host" : p.role === "guest" ? "Player" : `${esc(BOT_BY_KIND[p.kind]?.label || p.kind)} bot`;
+    const you = p.you || (host && p.role === "host");
+    const tools = !host ? ""
+      : p.role === "bot" ? `<span class="lb-tools"><select data-bot="${p.botIdx}" aria-label="Bot for seat ${i + 1}">${botOptions(p.kind)}</select>
+          <button type="button" class="btn sm ghost" data-remove-bot="${p.botIdx}">Remove</button></span>`
+      : p.role === "guest" ? `<span class="lb-tools"><button type="button" class="btn sm ghost" data-kick="${esc(p.id)}">Remove</button></span>` : "";
+    return `<div class="lb-player ${p.role}${you ? " you" : ""}"><span class="seat-no">${i + 1}</span>
+      <span class="seat-name">${esc(p.name)}${you ? " (you)" : ""}<small>${role}</small></span>${tools}</div>`;
+  }).join("");
+  $("lb-bots").hidden = !host || n >= MAX_SEATS;
+
+  $("lb-chart").innerHTML = Object.entries(CHARTS).map(([key, c]) => {
+    const bars = c.values.map((v) => `<i style="height:${Math.max(6, (v / 20) * 100)}%"></i>`).join("");
+    return `<button type="button" class="chart-opt" data-chart="${key}" aria-pressed="${key === state.settings.chart}" ${host ? "" : "disabled"}
+      title="Chart ${key}: ${c.values.join(", ")}"><b>${key}</b><span class="mini-bars">${bars}</span><small>${c.label}</small></button>`;
+  }).join("");
+  seg("lb-time", state.settings.time, (v) => { prefs.onlineTime = Number(v); savePrefs(); syncLobby(); });
+  for (const b of $("lb-time").querySelectorAll("button")) b.disabled = !host;
+  $("lb-coach").checked = !!state.settings.coach;
+  $("lb-coach").disabled = !host;
+  $("lb-settings-note").textContent = host ? "" : "set by the host";
+
+  const ready = engine.status === "ready";
+  $("lb-start").hidden = !host;
+  $("lb-start").disabled = n < MIN_SEATS || !ready;
+  $("lb-start").textContent = ready ? "Start the game" : "Engine loading…";
+  $("lb-status").textContent = host
+    ? n < MIN_SEATS ? `Add ${MIN_SEATS - n} more player${MIN_SEATS - n > 1 ? "s" : ""} or bot${MIN_SEATS - n > 1 ? "s" : ""} to start.` : ""
+    : "Waiting for the host to start…";
+}
+
+function wireLobby() {
+  $("lb-copy").onclick = async () => {
+    try { await navigator.clipboard.writeText($("lb-code").textContent); toast("Code copied."); }
+    catch (_) { toast(`The code is ${esc($("lb-code").textContent)}.`); }
+  };
+  $("lb-leave").onclick = () => { leaveOnline(); showScreen("setup"); };
+  $("lb-start").onclick = hostStart;
+  $("lb-add-bot").onclick = () => {
+    if (online?.role !== "host" || lobbyPlayers().length >= MAX_SEATS) return;
+    prefs.onlineBots.push($("lb-bot-kind").value);
+    savePrefs();
+    syncLobby();
+  };
+  $("lb-bot-kind").innerHTML = botOptions("evo4");
+  $("lb-coach").onchange = (e) => { prefs.onlineCoach = e.target.checked; savePrefs(); syncLobby(); };
+  $("lb-chart").onclick = (e) => {
+    const b = e.target.closest("[data-chart]");
+    if (!b || online?.role !== "host") return;
+    prefs.chart = b.dataset.chart;
+    savePrefs();
+    syncLobby();
+  };
+  $("lb-players").onclick = (e) => {
+    if (online?.role !== "host") return;
+    const remove = e.target.closest("[data-remove-bot]"), kick = e.target.closest("[data-kick]");
+    if (remove) {
+      prefs.onlineBots.splice(Number(remove.dataset.removeBot), 1);
+      savePrefs();
+      syncLobby();
+    } else if (kick) {
+      const m = online.members.find((x) => x.id === kick.dataset.kick);
+      if (!m) return;
+      online.members = online.members.filter((x) => x !== m);
+      refuse(m.id, "The host removed you from the room.");
+      syncLobby();
+    }
+  };
+  $("lb-players").onchange = (e) => {
+    const sel = e.target.closest("[data-bot]");
+    if (!sel || online?.role !== "host") return;
+    prefs.onlineBots[Number(sel.dataset.bot)] = sel.value;
+    savePrefs();
+    syncLobby();
+  };
+}
+
+// Host ------------------------------------------------------------------------
+
+async function startHosting() {
+  const btn = $("online-host");
+  leaveOnline();
+  btn.disabled = true;
+  btn.textContent = "Opening a room…";
+  try {
+    const room = await hostRoom({
+      onMessage: hostMessage,
+      onLeave: hostLeave,
+      onError: (text) => toast(esc(text), { error: true, ms: 6000 }),
+    });
+    online = { role: "host", room, code: room.code, members: [], game: null };
+    showLobby();
+  } catch (err) {
+    toast(esc(err.message), { error: true, ms: 7000 });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Host a game";
+  }
+}
+
+// Seats as they'll be dealt: you, then players in the order they joined, then bots.
+function lobbyPlayers() {
+  return [
+    { name: playerName(), role: "host" },
+    ...online.members.filter((m) => m.connected).map((m) => ({ name: m.name, role: "guest", id: m.id, token: m.token })),
+    ...prefs.onlineBots.map((kind, botIdx) => ({ name: BOT_NAMES[botIdx], role: "bot", kind, botIdx })),
+  ];
+}
+
+function syncLobby() {
+  if (online?.role !== "host") return;
+  const players = lobbyPlayers();
+  const settings = { chart: prefs.chart, time: prefs.onlineTime, coach: prefs.onlineCoach };
+  for (const m of online.members) {
+    if (!m.connected) continue;
+    // Each player gets the list with only their own row marked: no one else's token.
+    const list = players.map(({ name, role, kind, token }) => ({ name, role, kind, you: token === m.token }));
+    online.room.send(m.id, { t: "lobby", code: online.code, players: list, settings, inGame: !!online.game });
+  }
+  if (!online.game) renderLobby({ code: online.code, players, settings });
+}
+
+function refuse(id, reason) {
+  online.room.send(id, { t: "refused", reason });
+  setTimeout(() => online?.room.drop(id), 400);
+}
+
+function hostMessage(id, msg) {
+  if (online?.role !== "host") return;
+  if (msg.t === "hello") return hostHello(id, msg);
+  const m = online.members.find((x) => x.id === id);
+  if (!m) return;
+  if (msg.t === "bid") hostBid(m.seat, msg.round, msg.amount);
+  else if (msg.t === "reveal") hostReveal(m.seat, msg.color);
+  else if (msg.t === "leave") { hostLeave(id); online.room.drop(id); }
+}
+
+function hostHello(id, msg) {
+  const token = String(msg.token ?? "").slice(0, 64);
+  const name = String(msg.name ?? "").trim().slice(0, 20) || "Player";
+  const back = token && online.members.find((m) => m.token === token);
+  if (back) {
+    // Back after a dropped connection (or a reload): same seat.
+    Object.assign(back, { id, name: online.game ? back.name : name, connected: true });
+  } else if (online.game) {
+    return refuse(id, "That game has already started. Ask the host to go back to the lobby.");
+  } else if (1 + online.members.filter((m) => m.connected).length >= MAX_SEATS) {
+    return refuse(id, "That room is full.");
+  } else {
+    online.members.push({ id, token, name, connected: true, seat: null });
+    // A new player takes a bot's seat if the table is full.
+    if (lobbyPlayers().length > MAX_SEATS) { prefs.onlineBots.splice(MAX_SEATS - lobbyPlayers().length); savePrefs(); }
+  }
+  syncLobby();
+  if (back && online.game) {
+    online.room.send(id, { t: "start", seat: back.seat, settings: online.game.settings });
+    sendView(back, true);
+    hostStatus();
+  }
+}
+
+function hostLeave(id) {
+  const m = online?.members.find((x) => x.id === id);
+  if (!m || !m.connected) return;
+  m.connected = false;
+  if (!online.game) {
+    online.members = online.members.filter((x) => x !== m);
+  } else {
+    toast(`${esc(m.name)} dropped out. Their moves are made for them until they rejoin.`, { ms: 5000 });
+    hostStatus();
+    hostMaybeResolve();
+  }
+  syncLobby();
+}
+
+async function hostStart() {
+  if (online?.role !== "host" || online.game || engine.status !== "ready") return;
+  const members = online.members.filter((m) => m.connected);
+  const seats = [
+    { kind: "human", name: playerName() },
+    ...members.map((m) => ({ kind: "human", name: m.name })),
+    ...prefs.onlineBots.map((kind, i) => ({ kind, name: BOT_NAMES[i] })),
+  ];
+  if (seats.length < MIN_SEATS || seats.length > MAX_SEATS) return;
+  members.forEach((m, i) => { m.seat = i + 1; });
+  online.members = members;
+  const settings = { chart: prefs.chart, time: prefs.onlineTime, coach: prefs.onlineCoach };
+  const humanSeats = seats.flatMap((s, i) => (s.kind === "human" ? [i] : []));
+  online.game = { settings, seats, humanSeats, views: null, pending: null, resolving: false };
+  for (const m of members) online.room.send(m.id, { t: "start", seat: m.seat, settings });
+  syncLobby();
+  beginOnlineGame(hostDriver, settings);
+  try {
+    await engine.call("new", { seats, chart: settings.chart, seed: null, explain: false });
+    hostDeliver(await engine.call("views"));
+  } catch (err) {
+    toast(`Couldn't start the game: ${esc(err.message)}`, { error: true, ms: 8000 });
+    hostBackToLobby();
+  }
+}
+
+function hostBackToLobby() {
+  clearTimeout(online.game?.pending?.timer);
+  online.game = null;
+  online.members = online.members.filter((m) => m.connected);
+  for (const m of online.members) m.seat = null;
+  gameToken++;
+  game = null;
+  stopClock();
+  showLobby();
+}
+
+const tableName = (seat) => online.game.seats[seat]?.name ?? "?";
+const seatAway = (seat) => seat !== 0 && !online.members.find((m) => m.seat === seat)?.connected;
+const firstGem = (seat) => online.game.views[seat]?.state.players[seat].hand?.[0];
+
+// What the table waits on now, and each seat's clock for it.
+function clockFor(seat) {
+  const g = online.game, p = g.pending;
+  if (!p?.deadline || (p.kind === "reveal" && p.seat !== seat)) return null;
+  return { msLeft: Math.max(0, p.deadline - Date.now()), total: g.settings.time * 1000 };
+}
+
+function sendView(m, catchUp = false) {
+  const view = online.game.views?.[m.seat];
+  if (!view || !m.connected) return;
+  // A rejoining player gets the current table, not the last round again.
+  online.room.send(m.id, { t: "view", view: catchUp ? { ...view, last_round: null } : view, clock: clockFor(m.seat) });
+}
+
+function hostDeliver(views) {
+  const g = online.game;
+  g.views = views;
+  clearTimeout(g.pending?.timer);
+  const lead = views["0"];
+  const kind = lead.phase === "bid" ? "bid" : lead.phase === "reveal" || lead.phase === "waiting" ? "reveal" : null;
+  g.pending = kind && {
+    kind, round: lead.state.round_number + 1, seat: kind === "reveal" ? lead.reveal_seat : null, bids: {}, deadline: null, timer: null,
+  };
+  const limit = g.settings.time * 1000;
+  if (g.pending && limit) {
+    g.pending.deadline = Date.now() + limit;
+    g.pending.timer = setTimeout(hostExpire, limit + GRACE_MS);
+  }
+  for (const m of online.members) sendView(m);
+  handleView(views["0"], clockFor(0));
+  hostStatus();
+  hostMaybeResolve();
+}
+
+function hostStatus() {
+  const g = online?.game, p = g?.pending;
+  const waiting = !p ? [] : p.kind === "bid" ? g.humanSeats.filter((s) => !(s in p.bids)).map(tableName) : [tableName(p.seat)];
+  online.room.broadcast({ t: "status", waiting });
+  if (game?.online) {
+    game.waiting = waiting;
+    if (game.busy) renderAction();
+  }
+}
+
+function hostMaybeResolve() {
+  const g = online?.game, p = g?.pending;
+  if (!p || g.resolving) return;
+  if (p.kind === "bid" && g.humanSeats.every((s) => s in p.bids || seatAway(s))) hostPlayBids();
+  else if (p.kind === "reveal" && seatAway(p.seat)) hostPlayReveal(firstGem(p.seat));
+}
+
+function hostExpire() {
+  const g = online?.game, p = g?.pending;
+  if (!p || g.resolving) return;
+  if (p.kind === "bid") hostPlayBids();
+  else hostPlayReveal(firstGem(p.seat));
+}
+
+async function hostPlayBids() {
+  const g = online.game, p = g.pending;
+  g.resolving = true;
+  clearTimeout(p.timer);
+  const bids = Object.fromEntries(g.humanSeats.map((s) => [s, p.bids[s] ?? 0])); // missing = 0
+  try {
+    const views = await engine.call("bid_all", { bids });
+    if (online?.game !== g) return;
+    g.resolving = false;
+    hostDeliver(views);
+  } catch (err) {
+    g.resolving = false;
+    toast(`Engine error: ${esc(err.message)}`, { error: true, ms: 8000 });
+  }
+}
+
+async function hostPlayReveal(color) {
+  const g = online.game, p = g.pending;
+  g.resolving = true;
+  clearTimeout(p.timer);
+  try {
+    const views = await engine.call("reveal_seat", { seat: p.seat, color });
+    if (online?.game !== g) return;
+    g.resolving = false;
+    hostDeliver(views);
+  } catch (err) {
+    g.resolving = false;
+    toast(`Engine error: ${esc(err.message)}`, { error: true, ms: 8000 });
+  }
+}
+
+function hostBid(seat, round, amount) {
+  const g = online?.game, p = g?.pending;
+  if (!p || p.kind !== "bid" || g.resolving || seat == null || round !== p.round || seat in p.bids) return;
+  p.bids[seat] = Math.max(0, Math.min(g.views[seat]?.max_bid ?? 0, Math.round(Number(amount)) || 0));
+  hostStatus();
+  hostMaybeResolve();
+}
+
+function hostReveal(seat, color) {
+  const g = online?.game, p = g?.pending;
+  if (!p || p.kind !== "reveal" || g.resolving || seat !== p.seat) return;
+  if (!(g.views[seat]?.state.players[seat].hand || []).includes(color)) return;
+  hostPlayReveal(color);
+}
+
+const hostDriver = {
+  local: false,
+  send(cmd, args) {
+    if (cmd === "bid") hostBid(0, game.view.state.round_number + 1, args.amount);
+    else if (cmd === "reveal") hostReveal(0, args.color);
+  },
+};
+
+// Player (guest) ----------------------------------------------------------------
+
+async function joinOnline(raw) {
+  const code = cleanCode(raw);
+  if (code.length !== CODE_LENGTH) return toast(`Room codes are ${CODE_LENGTH} letters and numbers.`, { error: true });
+  const btn = $("online-join");
+  leaveOnline();
+  btn.disabled = true;
+  btn.textContent = "Joining…";
+  try {
+    const room = await joinRoom(code, {
+      onMessage: guestMessage,
+      onClose: (why) => guestClosed(why),
+      onError: (text) => toast(esc(text), { error: true, ms: 6000 }),
+    });
+    online = { role: "guest", room, code, lobby: null, seat: null };
+    room.send({ t: "hello", v: 1, name: playerName(), token: onlineToken() });
+  } catch (err) {
+    toast(esc(err.message), { error: true, ms: 7000 });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Join";
+  }
+}
+
+function guestClosed(reason) {
+  if (!online) return;
+  online = null;
+  toast(esc(reason), { error: true, ms: 7000 });
+  if (game?.online) { gameToken++; game = null; stopClock(); }
+  showScreen("setup");
+}
+
+// Everything from the host is rebuilt field by field before it's rendered,
+// like a loaded log: numbers, real colours, escaped strings.
+function cleanView(v) {
+  const phases = ["bid", "reveal", "waiting", "game_over"];
+  const seat = (x) => (x == null ? null : int(x));
+  const st = cleanState(v?.state);
+  return {
+    phase: phases.includes(v?.phase) ? v.phase : "waiting",
+    seed: int(v?.seed), human_idx: seat(v?.human_idx), human_seats: listOf(v?.human_seats, int), reveal_seat: seat(v?.reveal_seat),
+    seat_kinds: listOf(v?.seat_kinds, str), state: st,
+    auction: v?.auction ? auctionOf(v.auction) : null, max_bid: v?.max_bid == null ? null : int(v.max_bid),
+    last_round: v?.last_round ? cleanResult(v.last_round) : null,
+    scores: v?.scores ? listOf(v.scores, (s) => ({
+      name: str(s?.name), coins: int(s?.coins), gem_value: int(s?.gem_value), mission_value: int(s?.mission_value),
+      loans_total: int(s?.loans_total), invest_returns: int(s?.invest_returns), total: int(s?.total),
+    })) : null,
+    final_hands: v?.final_hands ? listOf(v.final_hands, gemsOf) : null,
+  };
+}
+
+function guestMessage(msg) {
+  if (online?.role !== "guest") return;
+  if (msg.t === "lobby") {
+    online.lobby = {
+      code: online.code,
+      players: listOf(msg.players, (p) => ({ name: str(p?.name), role: ["host", "guest", "bot"].includes(p?.role) ? p.role : "guest", kind: str(p?.kind), you: !!p?.you })),
+      settings: { chart: CHARTS[msg.settings?.chart] ? msg.settings.chart : "A", time: int(msg.settings?.time), coach: !!msg.settings?.coach },
+    };
+    const playing = game?.online && game.view?.phase !== "game_over";
+    if (playing && !msg.inGame) { toast("The host ended the game."); gameToken++; game = null; stopClock(); }
+    if (!game) showLobby();
+  } else if (msg.t === "start") {
+    online.seat = int(msg.seat);
+    beginOnlineGame(guestDriver, { chart: str(msg.settings?.chart), time: int(msg.settings?.time), coach: !!msg.settings?.coach });
+  } else if (msg.t === "view") {
+    if (!game?.online) return;
+    const view = cleanView(msg.view);
+    if (view.human_idx !== online.seat) return;
+    handleView(view, msg.clock ? { msLeft: real(msg.clock.msLeft), total: real(msg.clock.total) } : null);
+  } else if (msg.t === "status") {
+    if (!game?.online) return;
+    game.waiting = listOf(msg.waiting, str);
+    if (game.busy) renderAction();
+  } else if (msg.t === "refused" || msg.t === "closed") {
+    guestClosed(str(msg.reason) || "The host closed the room.");
+  }
+}
+
+const guestDriver = {
+  local: false,
+  send(cmd, args) {
+    if (cmd === "bid") online?.room.send({ t: "bid", round: game.view.state.round_number + 1, amount: args.amount });
+    else if (cmd === "reveal") online?.room.send({ t: "reveal", color: args.color });
+  },
+};
 
 // --------------------------------------------------------------------------
 // Game log: every round as it was played (the table at bid time, the coach's
@@ -1253,7 +1848,7 @@ let review = null; // { record, idx, res, from }
 
 const stepCount = (rec) => rec.rounds.length + (rec.end ? 1 : 0);
 const seatName = (rec, k) => esc(rec.seats[k]?.name ?? `Seat ${k + 1}`);
-const kindLabel = (kind) => esc(kind === "human" ? "You" : BOT_BY_KIND[kind]?.label || kind);
+const kindLabel = (kind) => esc(kind === "human" ? "Player" : BOT_BY_KIND[kind]?.label || kind);
 
 function openReview(rec, from) {
   if (!stepCount(rec)) return toast("This game has no rounds to review yet.");
@@ -1455,11 +2050,17 @@ function reviewEnd() {
 engine.onStatus = renderEngineStatus;
 renderEngineStatus(engine.status, "Starting the Python engine…");
 wireSetup();
+wireLobby();
 renderSetup();
 renderPastGames();
 
+// Closing the host's tab ends the game for everyone: ask first.
+window.addEventListener("beforeunload", (e) => {
+  if (online?.role === "host" && online.game) e.preventDefault();
+});
+
 $("nav-quit").onclick = quitGame;
-$("end-setup").onclick = () => { game = null; showScreen("setup"); };
+$("end-setup").onclick = () => { if (game?.online) leaveOnline(); game = null; showScreen("setup"); };
 $("sp-step").onclick = () => { stopAuto(); act("step"); };
 $("sp-auto").onclick = toggleAuto;
 $("sp-speed").onchange = () => { if (game?.auto && !game.busy) scheduleAuto(); };

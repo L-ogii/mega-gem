@@ -642,6 +642,76 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .an-round-table .gem-row { display: inline-flex; gap: 2px; min-height: 0; vertical-align: middle; }
 
 /* ------------------------------------------------------------------ */
+/* Online play: setup cards, lobby, move clock                         */
+/* ------------------------------------------------------------------ */
+
+.chip.human { color: var(--gold); border-color: rgba(247, 201, 72, 0.35); }
+.online-box { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+.online-card {
+    display: grid;
+    gap: 10px;
+    align-content: start;
+    padding: 14px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-inset);
+    border: 1px solid var(--border);
+}
+.online-card h3 { font-size: 17px; }
+.online-card p { margin: 0; }
+.online-card .btn { justify-self: start; }
+.join-row { display: flex; gap: 8px; }
+.join-row input { width: 9ch; font-family: var(--mono); font-size: 18px; letter-spacing: 0.18em; text-transform: uppercase; text-align: center; }
+.online-note { grid-column: 1 / -1; margin: 0; }
+
+.lobby { max-width: 760px; margin: 0 auto; display: grid; gap: 16px; }
+.lobby-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.room-code { font-family: var(--mono); font-size: clamp(34px, 8vw, 48px); font-weight: 700; letter-spacing: 0.2em; color: var(--gold); line-height: 1.1; }
+.lb-players { display: grid; gap: 8px; }
+.lb-player {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: center;
+    padding: 8px 10px;
+    background: var(--bg-inset);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+.lb-player .seat-no {
+    width: 30px; height: 30px; border-radius: 50%;
+    display: grid; place-items: center;
+    font-weight: 700; font-size: 13px;
+    background: var(--bg-card-alt); color: var(--muted);
+}
+.lb-player.you .seat-no { background: var(--accent-strong); color: #fff; }
+.lb-player.guest .seat-no { background: rgba(247, 201, 72, 0.18); color: var(--gold); }
+.lb-player .seat-name { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lb-player .seat-name small { display: block; color: var(--muted); font-weight: 400; font-size: 12px; }
+.lb-tools { display: flex; gap: 6px; align-items: center; }
+.lb-tools select { width: auto; font-size: 13px; padding: 5px 8px; }
+.lb-bots { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
+.lb-bots select { width: auto; font-size: 13px; padding: 6px 8px; }
+.lb-settings { display: grid; gap: 14px; }
+.lb-settings > .panel-title { margin-bottom: 0; }
+.lb-settings > .panel-title span { text-transform: none; letter-spacing: 0; font-weight: 500; color: var(--faint); }
+.chart-opt:disabled, .seg button:disabled { cursor: default; opacity: 0.75; }
+.lobby-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 10px; }
+.lobby-actions #lb-status { margin-right: auto; }
+
+.timer-chip {
+    font-family: var(--mono);
+    font-size: 14px;
+    font-weight: 700;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border-strong);
+    background: var(--bg-card-alt);
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+}
+.timer-chip.urgent { color: #2a1d00; background: var(--warn); border-color: var(--warn); animation: pulse 0.8s infinite; }
+
+/* ------------------------------------------------------------------ */
 /* Past games + move-by-move review                                    */
 /* ------------------------------------------------------------------ */
 
@@ -793,6 +863,8 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
     .ctiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .ctile b { font-size: 19px; }
     .coach-table th, .coach-table td { padding: 5px 5px; }
+    .lb-player { grid-template-columns: 30px minmax(0, 1fr); }
+    .lb-tools { grid-column: 1 / -1; }
     .past-row { grid-template-columns: minmax(0, 1fr); }
     .past-actions { justify-content: flex-start; }
     .rv-lot-grid { grid-template-columns: minmax(0, 1fr); }

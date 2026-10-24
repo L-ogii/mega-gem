@@ -214,7 +214,11 @@ def serialize_round_result(result: dict) -> dict[str, Any]:
 
 
 class _NeedReveal(Exception):
-    """Raised mid-``play_round`` when the human won and must pick a gem."""
+    """Raised mid-``play_round`` when a human won and must pick a gem."""
+
+    def __init__(self, seat: int) -> None:
+        super().__init__(seat)
+        self.seat = seat
 
 
 class _BrowserHuman(Player):
@@ -222,8 +226,9 @@ class _BrowserHuman(Player):
 
     is_human = True
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, seat: int) -> None:
         super().__init__(name)
+        self.seat = seat
         self.pending_bid = 0
         self.pending_reveal: str | None = None
 
@@ -232,7 +237,7 @@ class _BrowserHuman(Player):
 
     def choose_gem_to_reveal(self, public_state, my_state) -> GemCard:
         if self.pending_reveal is None:
-            raise _NeedReveal()
+            raise _NeedReveal(self.seat)
         for gem in my_state.hand:
             if gem.color.value == self.pending_reveal:
                 return gem
@@ -248,15 +253,22 @@ class BrowserSession:
     """One game driven step-by-step from the browser.
 
     ``seats`` is a list of ``{"kind": "human" | <AI kind>, "name": str}``
-    in seating order, with at most one human. With no human the game is
-    a spectator match advanced by :meth:`step`.
+    in seating order. With no human the game is a spectator match
+    advanced by :meth:`step`. With one human, :meth:`bid` and
+    :meth:`reveal` drive it. With several (online play, hosted in one
+    browser), :meth:`bid_all` takes every human's bid at once and
+    :meth:`views` renders each human's own view.
 
-    Every public method returns a *view* dict::
+    Every public method returns a *view* dict (``views`` returns one per
+    human seat)::
 
-        {"phase": "bid" | "reveal" | "ready" | "game_over",
+        {"phase": "bid" | "reveal" | "waiting" | "ready" | "game_over",
          "state": {...}, "auction": {...} | None, "max_bid": int | None,
          "last_round": {...} | None, "rationale": [...] | None,
-         "scores": [...] | None, ...}
+         "scores": [...] | None, "reveal_seat": int | None, ...}
+
+    ``waiting`` is what every human but the winner sees while the winner
+    picks a gem to reveal.
     """
 
     def __init__(
@@ -275,19 +287,17 @@ class BrowserSession:
         self.explain = explain
         weights_dir = Path(weights_dir) if weights_dir is not None else DEFAULT_WEIGHTS_DIR
 
-        humans = [i for i, s in enumerate(seats) if s.get("kind") == "human"]
-        if len(humans) > 1:
-            raise ValueError("At most one human seat is supported.")
-        self.human_idx: int | None = humans[0] if humans else None
+        self.human_seats = [i for i, s in enumerate(seats) if s.get("kind") == "human"]
+        self.human_idx: int | None = self.human_seats[0] if self.human_seats else None
         self.seat_kinds = [s.get("kind", "heuristic") for s in seats]
 
         seat_rng = random.Random(self.seed)
         players: list[Player] = []
-        for seat in seats:
+        for i, seat in enumerate(seats):
             kind = seat.get("kind", "heuristic")
             name = str(seat.get("name") or kind)[:24]
             if kind == "human":
-                players.append(_BrowserHuman(name))
+                players.append(_BrowserHuman(name, i))
                 continue
             if kind not in AI_FACTORIES:
                 raise ValueError(f"Unknown AI kind: {kind!r}")
@@ -308,6 +318,8 @@ class BrowserSession:
         self.final_hands: list[list[str]] | None = None
         self._snapshot: tuple[GameState, random.Random] | None = None
         self._rationale: list | None = None
+        self.reveal_seat: int | None = None
+        self._last_round: dict | None = None
 
     # -- public API ------------------------------------------------------
 
@@ -322,16 +334,35 @@ class BrowserSession:
         self._human.pending_bid = int(amount)
         return self._play()
 
-    def reveal(self, color: str) -> dict:
+    def bid_all(self, amounts: dict) -> dict:
+        """Every human's bid at once (keys are seat numbers); a missing one is 0."""
+        if self.phase != "bid":
+            raise RuntimeError(f"Not expecting a bid (phase={self.phase}).")
+        for seat in self.human_seats:
+            raw = amounts.get(seat, amounts.get(str(seat), 0))
+            self.state.players[seat].pending_bid = int(raw or 0)
+        self._play()
+        return self.views()
+
+    def reveal(self, color: str, seat: int | None = None) -> dict:
         if self.phase != "reveal" or self._snapshot is None:
             raise RuntimeError(f"Not expecting a reveal (phase={self.phase}).")
+        if seat is not None and int(seat) != self.reveal_seat:
+            raise RuntimeError(f"Seat {seat} isn't the one revealing (seat {self.reveal_seat} is).")
         # Restore the pre-round snapshot and replay with the answer preloaded.
+        # Every human's bid lives on its player object, so it's in the snapshot.
         self.state, self.rng = self._snapshot
         self._snapshot = None
-        self._human.pending_reveal = str(color)
+        human = self.state.players[self.reveal_seat]
+        human.pending_reveal = str(color)
         result = play_round(self.state, rng=self.rng)
-        self._human.pending_reveal = None
+        human.pending_reveal = None
+        self.reveal_seat = None
         return self._finish_round(result)
+
+    def views(self) -> dict:
+        """Each human seat's own view of the current phase, keyed by seat."""
+        return {str(seat): self._view(self._last_round, seat) for seat in self.human_seats}
 
     def step(self) -> dict:
         if self.phase != "ready":
@@ -353,22 +384,25 @@ class BrowserSession:
         seeded from the game seed and round, so the result is reproducible.
 
         Returns ``{"round", "seats", "samples"}`` where each sample lists
-        the bids of ``seats`` (every non-human seat) on one deal.
+        the bids of ``seats`` (every bot seat) on one deal. Other humans'
+        hands are re-dealt too, since the viewer can't see them either.
         """
         if self.phase != "bid" or self.human_idx is None:
             raise RuntimeError(f"Not a human bid (phase={self.phase}).")
         scratch = copy.deepcopy(self.state)
         auction = scratch.auction_deck[-1]
-        seats = [i for i in range(scratch.num_players) if i != self.human_idx]
-        sizes = [len(scratch.player_states[i].hand) for i in seats]
-        pool = [g for i in seats for g in scratch.player_states[i].hand] + scratch.gem_deck
+        # Bots only: another human's bid isn't something to simulate.
+        seats = [i for i in range(scratch.num_players) if i not in self.human_seats]
+        hidden = [i for i in range(scratch.num_players) if i != self.human_idx]
+        sizes = [len(scratch.player_states[i].hand) for i in hidden]
+        pool = [g for i in hidden for g in scratch.player_states[i].hand] + scratch.gem_deck
         pool.sort(key=lambda g: g.color.value)  # depend on what's unseen, never on the real deal's order
         rng = random.Random(f"{self.seed}:{scratch.round_number}")
         out: list[list[int]] = []
         for _ in range(max(1, int(samples))):
             rng.shuffle(pool)
             k = 0
-            for i, size in zip(seats, sizes):
+            for i, size in zip(hidden, sizes):
                 scratch.player_states[i].hand = pool[k:k + size]
                 k += size
             scratch.gem_deck = pool[k:]
@@ -401,9 +435,11 @@ class BrowserSession:
         snapshot = copy.deepcopy((self.state, self.rng))
         try:
             result = play_round(self.state, rng=self.rng)
-        except _NeedReveal:
+        except _NeedReveal as need:
             self._snapshot = snapshot
             self.phase = "reveal"
+            self.reveal_seat = need.seat
+            self._last_round = None
             return self._view(last_round=None)
         return self._finish_round(result)
 
@@ -446,18 +482,26 @@ class BrowserSession:
             self.phase = "ready"
         else:
             self.phase = "bid"
+        self._last_round = last_round
         return self._view(last_round=last_round)
 
-    def _view(self, last_round: dict | None) -> dict:
+    def _view(self, last_round: dict | None, seat: int | None = None) -> dict:
+        """The table as ``seat`` sees it (default: the first human)."""
+        me = self.human_idx if seat is None else seat
         auction = self._current_auction()
         max_bid = None
-        if auction is not None and self.human_idx is not None:
-            max_bid = max_legal_bid(self.state.player_states[self.human_idx], auction)
-        viewer = None if self.phase == "game_over" else self.human_idx
+        if auction is not None and me is not None:
+            max_bid = max_legal_bid(self.state.player_states[me], auction)
+        phase = self.phase
+        if phase == "reveal" and me != self.reveal_seat:
+            phase = "waiting"
+        viewer = None if self.phase == "game_over" else me
         return {
-            "phase": self.phase,
+            "phase": phase,
             "seed": self.seed,
-            "human_idx": self.human_idx,
+            "human_idx": me,
+            "human_seats": list(self.human_seats),
+            "reveal_seat": self.reveal_seat,
             "seat_kinds": list(self.seat_kinds),
             "state": serialize_state(self.state, viewer_idx=viewer),
             "auction": serialize_auction(auction) if auction is not None else None,

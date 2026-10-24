@@ -170,6 +170,83 @@ class RivalBidsTest(unittest.TestCase):
         self.assertEqual(real.rival_bids(50), swapped.rival_bids(50))
 
 
+MULTI_SEATS = [
+    {"kind": "human", "name": "Ana"},
+    {"kind": "heuristic", "name": "H"},
+    {"kind": "human", "name": "Ben"},
+    {"kind": "evo4", "name": "E4"},
+]
+MULTI_BIDS = {0: 3, 2: 6}
+
+
+def _drive_multi(session, bids=MULTI_BIDS):
+    """Play a whole multi-human session: fixed bids, the winner reveals its first hand gem."""
+    session.start()
+    views = session.views()
+    reveals = 0
+    while views["0"]["phase"] != "game_over":
+        phases = {v["phase"] for v in views.values()}
+        if phases == {"bid"}:
+            views = session.bid_all({str(k): v for k, v in bids.items()})
+        else:
+            seat = views["0"]["reveal_seat"]
+            reveals += 1
+            session.reveal(views[str(seat)]["state"]["players"][seat]["hand"][0], seat)
+            views = session.views()
+    return views, reveals
+
+
+class MultiHumanTest(unittest.TestCase):
+    def test_matches_a_direct_engine_run(self):
+        session = BrowserSession(MULTI_SEATS, chart="B", seed=4)
+        views, reveals = _drive_multi(session)
+
+        seat_rng = random.Random(4)
+        players = []
+        for i, seat in enumerate(MULTI_SEATS):
+            if seat["kind"] == "human":
+                players.append(ScriptedHuman(seat["name"], MULTI_BIDS[i]))
+            else:
+                players.append(AI_FACTORIES[seat["kind"]](
+                    seat["name"], seed=seat_rng.randrange(2**31),
+                    num_players=4, weights_dir=DEFAULT_WEIGHTS_DIR,
+                ))
+        state = setup_game(players, chart="B", seed=4)
+        rng = random.Random(4)
+        bids = []
+        while not is_game_over(state):
+            bids.append(play_round(state, rng=rng)["bids"])
+
+        self.assertEqual([r["bids"] for r in session.history], bids)
+        self.assertEqual(views["0"]["scores"], score_game(state))
+        self.assertGreater(reveals, 0)
+
+    def test_each_human_sees_only_their_own_hand(self):
+        session = BrowserSession(MULTI_SEATS, seed=6)
+        session.start()
+        views = session.views()
+        self.assertEqual(set(views), {"0", "2"})
+        for seat, view in views.items():
+            self.assertEqual(view["human_idx"], int(seat))
+            self.assertEqual(view["human_seats"], [0, 2])
+            for i, p in enumerate(view["state"]["players"]):
+                self.assertEqual("hand" in p, i == int(seat))
+
+    def test_others_wait_while_the_winner_reveals(self):
+        session = BrowserSession(MULTI_SEATS, seed=6)
+        session.start()
+        views = session.views()
+        while views["0"]["phase"] == "bid":
+            views = session.bid_all({"0": 99, "2": 0})  # Ana outbids everyone
+        self.assertEqual(views["0"]["phase"], "reveal")
+        self.assertEqual(views["0"]["reveal_seat"], 0)
+        self.assertEqual(views["2"]["phase"], "waiting")
+        with self.assertRaises(RuntimeError):
+            session.reveal("Blue", seat=2)
+        session.reveal(views["0"]["state"]["players"][0]["hand"][0], seat=0)
+        self.assertEqual(session.history[-1]["winner_idx"], 0)
+
+
 class SessionGuardTest(unittest.TestCase):
     def test_rejects_out_of_phase_calls(self):
         session = BrowserSession(SEATS, seed=1)
@@ -181,9 +258,7 @@ class SessionGuardTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             session.step()
 
-    def test_rejects_two_humans_and_unknown_kinds(self):
-        with self.assertRaises(ValueError):
-            BrowserSession([{"kind": "human"}] * 3)
+    def test_rejects_unknown_kinds(self):
         with self.assertRaises(ValueError):
             BrowserSession([{"kind": "nope"}] * 3)
 
