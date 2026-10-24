@@ -31,6 +31,8 @@ const CASH_VALUE_MAX = 2;
 const MISSION_SHARE = 0.5; // open-mission coins expected to be claimed, for valuing cash
 const LOAN_LIQUIDITY_SHARE = 1;
 const LOAN_BID_MAX = 6;
+// Below this win chance a bid is a lottery ticket, not advice: say pass.
+const MIN_WIN_CHANCE = 0.05;
 
 const chartAt = (values, n) => values[Math.min(Math.max(n, 0), 5)];
 const sum = (xs) => xs.reduce((s, x) => s + x, 0);
@@ -241,6 +243,39 @@ function tieRelation(order, me, other) {
 const neededToBeat = (rivals) => Math.max(0, ...rivals.map((r) => r.likely + (r.youWinTie === true ? 0 : 1)));
 const topRival = (rivals) => rivals.reduce((best, r) => (!best || r.likely + !r.youWinTie > best.likely + !best.youWinTie ? r : best), null);
 const tieNote = (r) => (r.youWinTie === true ? "you win ties" : r.youWinTie === false ? `${r.name} wins ties` : "ties are random");
+const quantile = (sorted, q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+
+/**
+ * Use the bots' own bids instead of the model above. `sim` comes from
+ * BrowserSession.rival_bids: each sample is every rival's real bid on one
+ * random deal of the cards you can't see. Sets each rival's likely bid
+ * (median) and 10–90% range, and returns the win chance for a bid straight
+ * from the joint samples, or null when `sim` is missing or stale.
+ */
+function sampledWinChance(sim, rivals, round) {
+  if (!sim || sim.round !== round || !sim.samples?.length) return null;
+  const col = new Map(sim.seats.map((seat, k) => [seat, k]));
+  if (!rivals.every((r) => col.has(r.idx))) return null;
+  for (const r of rivals) {
+    const xs = sim.samples.map((s) => s[col.get(r.idx)]).sort((a, b) => a - b);
+    r.likely = quantile(xs, 0.5);
+    r.low = quantile(xs, 0.1);
+    r.high = quantile(xs, 0.9);
+  }
+  return (bid) => {
+    let wins = 0;
+    for (const s of sim.samples) {
+      let tied = 0, lost = false;
+      for (const r of rivals) {
+        const x = s[col.get(r.idx)];
+        if (x > bid || (x === bid && r.youWinTie === false)) { lost = true; break; }
+        if (x === bid && r.youWinTie === null) tied++;
+      }
+      if (!lost) wins += 1 / (tied + 1);
+    }
+    return wins / sim.samples.length;
+  };
+}
 
 // --------------------------------------------------------------------------
 // Live advice
@@ -248,9 +283,11 @@ const tieNote = (r) => (r.youWinTie === true ? "you win ties" : r.youWinTie === 
 
 /**
  * Advice for the human's current bid, or null outside a human bid.
- * Reads only public state and the viewer's own hand.
+ * Reads only public state and the viewer's own hand. `sim` is optional:
+ * the bots' sampled bids (see sampledWinChance); without it, rivals are
+ * modelled.
  */
-export function advise(view) {
+export function advise(view, sim = null) {
   if (!view || view.human_idx === null || view.human_idx === undefined || !view.auction) return null;
   if (view.phase && view.phase !== "bid") return null;
   const st = view.state, a = view.auction, me = view.human_idx;
@@ -266,12 +303,12 @@ export function advise(view) {
     reserve, spare: Math.max(0, you.coins - reserve),
     cashValue: cash.lambda, futureValue: cash.futureValue, cashInPlay: cash.cashInPlay,
   };
-  if (a.kind === "treasure") return { ...base, ...adviseTreasure(st, a, me, cap, mine, pub, ties, cash.lambda) };
-  if (a.kind === "invest") return { ...base, ...adviseInvest(st, a, me, cap, pub, ties, cash.lambda, base.spare) };
-  return { ...base, ...adviseLoan(st, a, cap, cash.lambda, reserve) };
+  if (a.kind === "treasure") return { ...base, ...adviseTreasure(st, a, me, cap, mine, pub, ties, cash.lambda, sim) };
+  if (a.kind === "invest") return { ...base, ...adviseInvest(st, a, me, cap, pub, ties, cash.lambda, base.spare, sim) };
+  return { ...base, ...adviseLoan(st, a, me, cap, ties, cash.lambda, reserve, sim) };
 }
 
-function adviseTreasure(st, a, me, cap, mine, pub, ties, lambda) {
+function adviseTreasure(st, a, me, cap, mine, pub, ties, lambda, sim) {
   const you = st.players[me];
   const offered = st.revealed_gems.slice(0, a.gems);
   const gained = countColors(offered);
@@ -304,13 +341,15 @@ function adviseTreasure(st, a, me, cap, mine, pub, ties, lambda) {
     }];
   });
   const denial = rivals.flatMap((r) => r.missions.map((m) => ({ rival: r.name, ...m })));
+  const sampled = sampledWinChance(sim, rivals, st.round_number + 1);
+  const chance = sampled ?? ((b) => winProb(b, rivals));
   const needed = neededToBeat(rivals);
   const top = topRival(rivals);
 
   // Maximise expected surplus with every coin paid charged at `lambda`.
   let best = { bid: 0, e: -Infinity, p: 0 };
   for (let b = 0; b <= Math.min(cap, breakEven); b++) {
-    const p = winProb(b, rivals);
+    const p = chance(b);
     const e = (fair - lambda * b) * p;
     if (e > best.e + 1e-9) best = { bid: b, e, p };
   }
@@ -318,11 +357,11 @@ function adviseTreasure(st, a, me, cap, mine, pub, ties, lambda) {
   let suggested = best.bid, verdict, reason;
   const net = fair - lambda * best.bid;
   const short = cap < ceiling; // your cash, not the lot's value, is the limit
-  const vsTop = `${top.name}'s est. ~${top.likely} (${tieNote(top)})`;
+  const vsTop = `${top.name}'s ${sampled ? "" : "est. "}~${top.likely} (${tieNote(top)})`;
   if (!offered.length) {
     suggested = 0; verdict = "pass";
     reason = "No gems are left on the row, so this lot is worth nothing. Bid 0.";
-  } else if (fair < 1 || best.bid === 0 || best.e < 0.25) {
+  } else if (fair < 1 || best.bid === 0 || best.e < 0.25 || best.p < MIN_WIN_CHANCE) {
     suggested = 0; verdict = "pass";
     reason = fair < 1
       ? `Worth only ~${fmt(fair)} to you. Bid 0.`
@@ -342,23 +381,26 @@ function adviseTreasure(st, a, me, cap, mine, pub, ties, lambda) {
       : `Bid ${suggested} as a cheap shot: ${pct(best.p)} to win against ${vsTop}. Nets ~${fmt(fair - suggested)} if it lands; bidding more costs more than the extra win chance is worth.`;
   }
 
-  const p = suggested === best.bid ? best.p : winProb(suggested, rivals);
+  const p = suggested === best.bid ? best.p : chance(suggested);
   return {
     offered, gemsEv, missions: missions.map((m) => ({ name: m.name, coins: m.coins })), missionValue,
     publicGemsEv, edge: gemsEv - publicGemsEv, fair, breakEven, ceiling,
-    rivals: rivals.map(({ pmf, ...r }) => r), needed, setsUp, denial,
+    rivals: rivals.map(({ pmf, ...r }) => r), rivalSource: sampled ? "bots" : "model", needed, setsUp, denial,
     suggested, verdict, reason, winProb: p, expSurplus: (fair - suggested) * p,
   };
 }
 
-function adviseInvest(st, a, me, cap, pub, ties, lambda, spare) {
-  // Rivals modelled like HeuristicAI: bid surplus cash, with a token 1.
+function adviseInvest(st, a, me, cap, pub, ties, lambda, spare, sim) {
+  // Without the bots' sampled bids, rivals are modelled like HeuristicAI:
+  // bid surplus cash, with a token 1.
   const held = rivalReserve(st, pub);
   const rivals = st.players.flatMap((p, i) => {
     if (i === me) return [];
     const likely = p.coins > 0 ? Math.min(p.coins, Math.max(1, p.coins - held)) : 0;
     return [{ idx: i, name: p.name, coins: p.coins, likely, youWinTie: tieRelation(ties, me, i), pmf: bidPmf(likely, p.coins) }];
   });
+  const sampled = sampledWinChance(sim, rivals, st.round_number + 1);
+  const chance = sampled ?? ((b) => winProb(b, rivals));
   const needed = neededToBeat(rivals);
   const top = topRival(rivals);
 
@@ -368,39 +410,56 @@ function adviseInvest(st, a, me, cap, pub, ties, lambda, spare) {
   // hold are the ones that buy your next lot.
   let best = { bid: 0, score: -Infinity, p: 0 };
   for (let b = 0; b <= cap; b++) {
-    const p = winProb(b, rivals);
+    const p = chance(b);
     const score = p * (a.amount - (lambda - 1) * (b + Math.max(0, b - spare))) - 0.01 * b;
     if (score > best.score + 1e-9) best = { bid: b, score, p };
   }
+  if (best.p < MIN_WIN_CHANCE) best = { bid: 0, p: chance(0) };
   const suggested = best.bid;
   const verdict = suggested === 0 ? "pass" : best.p >= 0.5 ? "buy" : "shot";
   const lead = `Invest pays back your bid plus ${a.amount}, so a win is +${a.amount} at any price; the cost is cash locked until the end.`;
   const reason = cap === 0
     ? `${lead} You have no coins to lock, so bid 0.`
     : suggested === 0
-      ? `${lead} Beating ${top.name}'s est. ~${top.likely} would lock more buying power than the +${a.amount} is worth. Bid 0.`
-      : `${lead} Bid ${suggested}: about ${pct(best.p)} to beat ${top.name}'s est. ~${top.likely} (${tieNote(top)}).`;
+      ? `${lead} Beating ${top.name}'s ${sampled ? "" : "est. "}~${top.likely} would lock more buying power than the +${a.amount} is worth. Bid 0.`
+      : `${lead} Bid ${suggested}: about ${pct(best.p)} to beat ${top.name}'s ${sampled ? "" : "est. "}~${top.likely} (${tieNote(top)}).`;
   return {
     fair: a.amount, breakEven: cap, needed,
-    rivals: rivals.map(({ pmf, ...r }) => r),
+    rivals: rivals.map(({ pmf, ...r }) => r), rivalSource: sampled ? "bots" : "model",
     suggested, verdict, reason, winProb: best.p, expSurplus: a.amount * best.p,
   };
 }
 
-function adviseLoan(st, a, cap, lambda, reserve) {
+function adviseLoan(st, a, me, cap, ties, lambda, reserve, sim) {
   const coins = cap - a.amount;
   const shortfall = Math.max(0, reserve - coins);
   const gemsLeft = st.gem_deck_count + st.revealed_gems.length;
   // Borrowed coins are only worth something when you're short of cash:
   // each one then buys about (lambda − 1) of surplus on later lots.
   const liquidity = shortfall && gemsLeft >= 2 ? LOAN_LIQUIDITY_SHARE * (lambda - 1) * Math.min(shortfall, a.amount) : 0;
-  const suggested = Math.min(cap, LOAN_BID_MAX, Math.floor(liquidity));
+  const rivals = st.players.flatMap((p, i) => (i === me ? [] : [{ idx: i, name: p.name, coins: p.coins, likely: 0, youWinTie: tieRelation(ties, me, i) }]));
+  const chance = sampledWinChance(sim, rivals, st.round_number + 1);
+  // With the bots' real bids, best-respond: the cheapest bid that wins the
+  // cash for less than it's worth. Without them, a small capped bid.
+  let suggested = Math.min(cap, LOAN_BID_MAX, Math.floor(liquidity)), p = null;
+  if (chance) {
+    let best = { bid: 0, e: -Infinity, p: 0 };
+    for (let b = 0; b <= Math.min(cap, Math.floor(liquidity)); b++) {
+      const q = chance(b), e = (liquidity - b) * q;
+      if (e > best.e + 1e-9) best = { bid: b, e, p: q };
+    }
+    suggested = best.p < MIN_WIN_CHANCE ? 0 : best.bid;
+    p = chance(suggested);
+  }
+  const top = topRival(rivals);
   const lead = `A loan's bid is a pure cost: you get ${a.amount} now and repay ${a.amount} at the end.`;
   const reason = suggested === 0
-    ? `${lead} ${shortfall === 0 ? "You have enough cash for the lots ahead" : gemsLeft < 2 ? "Too few gems are left to spend it on" : "The extra cash isn't worth paying for"}, so bid 0. If nobody bids, a 0 can still win it for free.`
-    : `${lead} You're ~${shortfall} short of the ~${reserve} the remaining lots call for, so a small bid of ${suggested} buys ${a.amount} coins of buying power. Whatever you bid is lost.`;
+    ? `${lead} ${shortfall === 0 ? "You have enough cash for the lots ahead" : gemsLeft < 2 ? "Too few gems are left to spend it on" : "The extra cash isn't worth what rivals will bid for it"}, so bid 0. If nobody bids, a 0 can still win it for free.`
+    : `${lead} You're ~${shortfall} short of the ~${reserve} the remaining lots call for, so ${a.amount} extra coins are worth ~${fmt(liquidity)} to you. `
+      + (chance ? `Bid ${suggested}: about ${pct(p)} to beat ${top.name}'s ~${top.likely} (${tieNote(top)}).` : `A small bid of ${suggested} buys it. Whatever you bid is lost.`);
   return {
-    fair: 0, breakEven: 0, liquidity, suggested, verdict: suggested === 0 ? "pass" : "thin", winProb: null, expSurplus: -suggested, reason,
+    fair: 0, breakEven: 0, liquidity, suggested, verdict: suggested === 0 ? "pass" : "thin",
+    rivals: chance ? rivals : [], rivalSource: chance ? "bots" : "model", winProb: p, expSurplus: -suggested, reason,
   };
 }
 
@@ -415,7 +474,8 @@ function adviseLoan(st, a, cap, lambda, reserve) {
  * round; loan: 0; invest: bid + amount.
  *
  * `snapshots` maps round → `view.state` at bid time. Without them the
- * ledger still works, only the per-seat fair values are missing.
+ * ledger still works, only the per-seat fair values are missing. Each
+ * round also carries `hands`: every seat's real hand as that round began.
  */
 export function analyze(endView, log, snapshots = {}) {
   const st = endView.state;
@@ -470,7 +530,7 @@ export function analyze(endView, log, snapshots = {}) {
 
     const row = {
       round: r.round, auction: a, lot: lotText(a), taken: r.taken_gems, winner: w, winnerName: names[w],
-      price, bids: r.bids, gross, surplus, fair, myBid: null, myFair: null,
+      price, bids: r.bids, gross, surplus, fair, myBid: null, myFair: null, hands: handAt[r.round],
     };
 
     if (human !== null) {

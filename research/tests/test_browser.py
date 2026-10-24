@@ -10,7 +10,7 @@ from megagem.browser import (
     BrowserSession,
     _load_evo_weights,
 )
-from megagem.engine import is_game_over, play_round, score_game, setup_game
+from megagem.engine import is_game_over, max_legal_bid, play_round, score_game, setup_game
 from megagem.players import Player
 
 
@@ -123,6 +123,51 @@ class ReplayTest(unittest.TestCase):
         first = explained.history[0]["rationale"]
         self.assertIsNone(first[0])
         self.assertEqual(first[2]["ai_class"], "Evo4AI")
+
+
+class RivalBidsTest(unittest.TestCase):
+    def test_does_not_perturb_the_game(self):
+        plain = BrowserSession(SEATS, seed=21)
+        _drive(plain, 3)
+        sampled = BrowserSession(SEATS, seed=21)
+        view = sampled.start()
+        while view["phase"] != "game_over":
+            if view["phase"] == "bid":
+                sampled.rival_bids(20)
+                view = sampled.bid(3)
+            else:
+                view = sampled.reveal(view["state"]["players"][0]["hand"][0])
+        self.assertEqual(
+            [r["bids"] for r in plain.history],
+            [r["bids"] for r in sampled.history],
+        )
+        self.assertEqual(plain.scores, sampled.scores)
+
+    def test_samples_are_legal_bids_for_every_rival(self):
+        session = BrowserSession(SEATS, seed=8)
+        view = session.start()
+        out = session.rival_bids(50)
+        self.assertEqual(out["round"], 1)
+        self.assertEqual(out["seats"], [1, 2, 3])
+        self.assertEqual(len(out["samples"]), 50)
+        auction = session.state.auction_deck[-1]
+        for sample in out["samples"]:
+            for seat, bid in zip(out["seats"], sample):
+                self.assertGreaterEqual(bid, 0)
+                self.assertLessEqual(bid, max_legal_bid(session.state.player_states[seat], auction))
+        self.assertEqual(session.rival_bids(50), out)  # reproducible
+
+    def test_ignores_how_the_hidden_cards_are_really_dealt(self):
+        """Swap a rival's hand card with a deck card: the human sees the same table, so nothing changes."""
+        real = BrowserSession(SEATS, seed=8)
+        real.start()
+        swapped = BrowserSession(SEATS, seed=8)
+        swapped.start()
+        hand, deck = swapped.state.player_states[1].hand, swapped.state.gem_deck
+        k = next(i for i, g in enumerate(deck) if g.color != hand[0].color)
+        hand[0], deck[k] = deck[k], hand[0]
+        self.assertEqual(real.view()["state"], swapped.view()["state"])
+        self.assertEqual(real.rival_bids(50), swapped.rival_bids(50))
 
 
 class SessionGuardTest(unittest.TestCase):

@@ -37,7 +37,7 @@ from .cards import (
     LoanCard,
     TreasureCard,
 )
-from .engine import is_game_over, max_legal_bid, play_round, score_game, setup_game
+from .engine import clamp_bid, is_game_over, max_legal_bid, play_round, score_game, setup_game
 from .missions import MissionCard
 from .players import (
     Evo2AI,
@@ -341,6 +341,43 @@ class BrowserSession:
     def view(self) -> dict:
         """Re-render the current phase without advancing (no ``last_round``)."""
         return self._view(last_round=None)
+
+    def rival_bids(self, samples: int = 200) -> dict:
+        """What each bot would bid on the current auction, for the EV coach.
+
+        Every card the human can't see (rivals' hands and the face-down
+        deck) is re-dealt at random, keeping hand sizes, and each bot's own
+        ``choose_bid`` runs on that deal. Nothing hidden from the human
+        feeds in. It all happens on a throwaway copy, so the live game
+        (state, RNGs, AI caches) is never touched; the sampling RNG is
+        seeded from the game seed and round, so the result is reproducible.
+
+        Returns ``{"round", "seats", "samples"}`` where each sample lists
+        the bids of ``seats`` (every non-human seat) on one deal.
+        """
+        if self.phase != "bid" or self.human_idx is None:
+            raise RuntimeError(f"Not a human bid (phase={self.phase}).")
+        scratch = copy.deepcopy(self.state)
+        auction = scratch.auction_deck[-1]
+        seats = [i for i in range(scratch.num_players) if i != self.human_idx]
+        sizes = [len(scratch.player_states[i].hand) for i in seats]
+        pool = [g for i in seats for g in scratch.player_states[i].hand] + scratch.gem_deck
+        pool.sort(key=lambda g: g.color.value)  # depend on what's unseen, never on the real deal's order
+        rng = random.Random(f"{self.seed}:{scratch.round_number}")
+        out: list[list[int]] = []
+        for _ in range(max(1, int(samples))):
+            rng.shuffle(pool)
+            k = 0
+            for i, size in zip(seats, sizes):
+                scratch.player_states[i].hand = pool[k:k + size]
+                k += size
+            scratch.gem_deck = pool[k:]
+            out.append([
+                clamp_bid(scratch.players[i].choose_bid(scratch, scratch.player_states[i], auction),
+                          scratch.player_states[i], auction)
+                for i in seats
+            ])
+        return {"round": self.state.round_number + 1, "seats": seats, "samples": out}
 
     # -- internals -------------------------------------------------------
 

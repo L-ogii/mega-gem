@@ -40,6 +40,8 @@ def megagem_call(cmd, args_json):
         return json.dumps(_session.step())
     if cmd == "view":
         return json.dumps(_session.view())
+    if cmd == "rival_bids":
+        return json.dumps(_session.rival_bids(int(args.get("samples", 200))))
     raise ValueError(f"Unknown command: {cmd!r}")
 `;
 
