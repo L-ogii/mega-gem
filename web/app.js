@@ -3,8 +3,9 @@
 // All game logic runs in engine-worker.js (Pyodide + the canonical
 // research/megagem package). This file only renders the views that
 // megagem.browser.BrowserSession returns and sends back bids/reveals.
-// The EV coach (coach.js) is pure JS over those same views and never
-// talks to the worker.
+// The EV coach (coach.js) is pure JS over those same views. Its only
+// engine call is `rival_bids`: the bots' own bids on random deals of the
+// cards the human can't see, run on a throwaway copy of the game.
 
 import { advise, analyze } from "./coach.js?v=__MEGAGEM_BUILD__";
 
@@ -53,6 +54,7 @@ const GEM_SHAPES = {
 
 const gemCache = {};
 function gem(color, size = "") {
+  if (!GEM_SHAPES[color]) return "";
   const key = color + size;
   if (gemCache[key]) return gemCache[key];
   const pts = GEM_SHAPES[color];
@@ -139,7 +141,7 @@ class Engine {
 // --------------------------------------------------------------------------
 
 const PREFS_KEY = "megagem.prefs.v2";
-const defaultPrefs = { mode: "play", players: 4, name: "", chart: "A", explain: false, coach: true, coachColors: true, bots: ["evo4", "evo4", "evo4", "evo4", "evo4"] };
+const defaultPrefs = { mode: "play", players: 4, name: "", chart: "A", explain: false, coach: true, coachColors: true, reviewHands: false, bots: ["evo4", "evo4", "evo4", "evo4", "evo4"] };
 
 function loadPrefs() {
   try {
@@ -158,12 +160,13 @@ function savePrefs() {
 
 const engine = new Engine();
 const prefs = loadPrefs();
-let game = null; // { config, view, token, busy, auto, autoTimer, log, snapshots, advice }
+let game = null; // { config, view, token, busy, auto, autoTimer, log, snapshots, advice, sim, decisions, record }
 let gameToken = 0;
 
 function showScreen(name) {
-  for (const s of ["setup", "game", "end"]) $(`screen-${s}`).hidden = s !== name;
+  for (const s of ["setup", "game", "end", "review"]) $(`screen-${s}`).hidden = s !== name;
   $("nav-quit").hidden = name !== "game";
+  if (name === "setup") renderPastGames();
   window.scrollTo({ top: 0 });
 }
 
@@ -290,7 +293,7 @@ function renderEngineStatus(status, detail) {
 async function startGame(config) {
   stopAuto();
   const token = ++gameToken;
-  game = { config, view: null, token, busy: true, auto: false, autoTimer: null, log: [], snapshots: {}, advice: null };
+  game = { config, view: null, token, busy: true, auto: false, autoTimer: null, log: [], snapshots: {}, advice: null, sim: null, decisions: {}, record: null };
   hideToast();
   $("g-log").innerHTML = "";
   showScreen("game");
@@ -299,6 +302,7 @@ async function startGame(config) {
     const view = await engine.call("new", config);
     if (token !== gameToken) return;
     game.config.seed = view.seed; // pin the seed so Rematch replays this exact deal
+    game.record = newRecord(config, view);
     handleView(view);
   } catch (err) {
     if (token !== gameToken) return;
@@ -311,6 +315,10 @@ async function act(cmd, args) {
   if (!game || game.busy) return;
   const token = game.token;
   game.busy = true;
+  if (cmd === "bid") {
+    const d = game.decisions[game.view.state.round_number + 1];
+    if (d) d.coachShown = prefs.coach;
+  }
   renderAction();
   $("g-coach").classList.add("stale");
   try {
@@ -336,9 +344,13 @@ function handleView(view) {
     game.log.push(view.last_round);
     appendLog(view.last_round, view);
     if (view.human_idx !== null) toast(roundSummary(view.last_round, view), { ms: 4200 });
+    recordRound(view.last_round);
   }
+  if (view.phase === "bid") requestSim(view);
   renderGame();
   if (view.phase === "game_over") {
+    game.record.end = { state: view.state, scores: view.scores, final_hands: view.final_hands };
+    saveRecord(game.record);
     stopAuto();
     setTimeout(() => { if (game && game.view === view) renderEnd(); }, view.human_idx === null ? 600 : 1400);
   } else if (view.phase === "ready" && game.auto) {
@@ -643,7 +655,7 @@ function renderBid(el) {
     hint = `Your bid is a cost: the ${a.amount} you receive is repaid at the end. Worth it only if you need cash now.`;
   }
   const quick = [...new Set([0, 1, Math.round(max / 4), Math.round(max / 2), max])].filter((v) => v <= max);
-  const adv = prefs.coach ? adviceFor(view) : null;
+  const adv = prefs.coach && coachReady(view) ? adviceFor(view) : null;
   const coachQuick = adv ? `<button type="button" class="btn sm coach-q" data-q="${adv.suggested}" title="EV coach suggestion">Coach ${adv.suggested}</button>` : "";
   el.classList.add("live");
   el.innerHTML = `<h3>Your sealed bid</h3>
@@ -701,13 +713,39 @@ const VERDICTS = { buy: ["Buy", "pos"], thin: ["Thin margin", "warn"], shot: ["L
 
 let setBid = null; // renderBid's setter, so the coach can fill the bid box
 
-// One advise() per view. The coach is an add-on: if it throws, log it and
-// carry on without it rather than breaking the game.
+const RIVAL_SAMPLES = 200;
+const simFor = (view) => (game.sim?.view === view ? game.sim : null);
+const coachReady = (view) => !!simFor(view) && !simFor(view).pending;
+
+// Ask the engine what the bots would bid on random deals of the cards you
+// can't see. Until it answers, the coach shows a placeholder; if it fails,
+// the coach falls back to its own rival model. Runs on every human bid,
+// coach shown or not, so the game log keeps the coach's view of each one.
+function requestSim(view) {
+  if (view.phase !== "bid" || view.human_idx === null || simFor(view)) return;
+  const sim = (game.sim = { view, pending: true, data: null });
+  game.decisions[view.state.round_number + 1] = { view, sim, coachShown: prefs.coach };
+  engine.call("rival_bids", { samples: RIVAL_SAMPLES })
+    .then((data) => { sim.data = data; })
+    .catch((err) => console.error("Rival sampling failed; using the coach's model:", err))
+    .finally(() => {
+      sim.pending = false;
+      if (game?.sim !== sim || game.view !== view || game.busy) return;
+      const typed = $("bid-num")?.value; // keep a half-entered bid across the re-render
+      renderAction();
+      if (typed !== undefined) setBid?.(typed);
+      renderCoach();
+    });
+}
+
+// One advise() per view (and per sample set). The coach is an add-on: if it
+// throws, log it and carry on without it rather than breaking the game.
 function adviceFor(view) {
-  if (game.advice?.view !== view) {
+  const sim = simFor(view);
+  if (game.advice?.view !== view || game.advice.sim !== sim?.data) {
     let adv = null;
-    try { adv = advise(view); } catch (err) { console.error("EV coach failed:", err); }
-    game.advice = { view, adv };
+    try { adv = advise(view, sim?.data ?? null); } catch (err) { console.error("EV coach failed:", err); }
+    game.advice = { view, sim: sim?.data, adv };
   }
   return game.advice.adv;
 }
@@ -733,7 +771,14 @@ function renderCoach() {
   btn.textContent = prefs.coach ? "Coach: on" : "Coach: off";
   const el = $("g-coach");
   el.classList.remove("stale");
-  const adv = prefs.coach && view.human_idx !== null && view.phase === "bid" ? adviceFor(view) : null;
+  const wanted = prefs.coach && view.human_idx !== null && view.phase === "bid";
+  if (wanted && !coachReady(view)) {
+    requestSim(view);
+    el.hidden = false;
+    $("g-coach-body").innerHTML = `<div class="waiting"><span class="spinner"></span>Running the bots' bidding on ${RIVAL_SAMPLES} deals of the cards you can't see…</div>`;
+    return;
+  }
+  const adv = wanted ? adviceFor(view) : null;
   el.hidden = !adv;
   if (!adv) return;
 
@@ -766,7 +811,7 @@ function renderCoach() {
       is still to be auctioned against ${adv.cashInPlay} coins in play, so the coach charges every coin you pay at that rate.</p>`);
   }
   if (adv.kind === "treasure") parts.push(coachTreasure(adv));
-  else if (adv.kind === "invest") parts.push(coachRivals(adv, false));
+  else if (adv.rivals?.length) parts.push(coachRivals(adv, false));
   parts.push(coachColors(adv));
   $("g-coach-body").innerHTML = parts.join("");
 
@@ -800,13 +845,16 @@ function coachRivals(adv, treasure) {
       <td><b>${esc(r.name)}</b></td>
       <td>${coin(r.coins)}</td>
       ${treasure ? `<td>${num1(r.value)}${r.missions.length ? ` <span class="chip mission" title="${esc(r.missions.map((m) => m.name).join(", "))}">★ +${r.missions.reduce((s, m) => s + m.coins, 0)}</span>` : ""}</td>` : ""}
-      <td>~${r.likely}</td>
+      <td>${r.low !== undefined && r.low !== r.high ? `${r.low}–${r.high}` : `~${r.likely}`}</td>
       <td class="${r.youWinTie === true ? "pos" : r.youWinTie === false ? "neg" : ""}">${tieText(r.youWinTie)}</td>
     </tr>`).join("");
+  const source = adv.rivalSource === "bots"
+    ? `Rival bids come from each bot's own bidding, run on ${RIVAL_SAMPLES} random deals of the cards you can't see (a range is the middle 80%).`
+    : "Rival figures are estimates from public information: each rival also knows its own hand.";
   return `<div class="coach-table-wrap"><table class="coach-table">
-      <thead><tr><th>Rival</th><th>Cash</th>${treasure ? "<th>Est. value</th>" : ""}<th>Likely bid</th><th>Ties</th></tr></thead>
+      <thead><tr><th>Rival</th><th>Cash</th>${treasure ? "<th>Est. value</th>" : ""}<th>${adv.rivalSource === "bots" ? "Bot's bid" : "Likely bid"}</th><th>Ties</th></tr></thead>
       <tbody>${rows}</tbody></table></div>
-    <p class="muted small">Rival figures are estimates from public information: each rival also knows its own hand.${adv.firstAuction ? " First auction, so ties are broken at random." : ""}</p>`;
+    <p class="muted small">${source}${adv.firstAuction ? " First auction, so ties are broken at random." : ""}</p>`;
 }
 
 function coachColors(adv) {
@@ -897,6 +945,9 @@ function renderEnd() {
   showScreen("end");
   $("end-rematch").onclick = () => startGame({ ...config });
   $("end-again").onclick = () => startGame({ ...config, seed: null });
+  const rec = game.record;
+  $("end-review").onclick = () => openReview(normalizeRecord(rec), "end");
+  $("end-download").onclick = () => downloadRecord(rec);
 }
 
 // Game analysis ------------------------------------------------------------
@@ -979,6 +1030,425 @@ function renderAnalysis() {
 }
 
 // --------------------------------------------------------------------------
+// Game log: every round as it was played (the table at bid time, the coach's
+// advice, every bid and the outcome), saved in this browser after each round
+// and downloadable as JSON, for the move-by-move review.
+// --------------------------------------------------------------------------
+
+const LOG_INDEX_KEY = "megagem.games.v1";
+const LOG_GAME_KEY = (id) => `megagem.game.${id}`;
+const LOG_LIMIT = 25;
+
+function newRecord(config, view) {
+  return {
+    format: "megagem-log", version: 1,
+    id: `${Date.now().toString(36)}-${view.seed}`,
+    startedAt: new Date().toISOString(), savedAt: null,
+    seed: view.seed, chart: view.state.value_chart,
+    seats: view.state.players.map((p, i) => ({ name: p.name, kind: view.seat_kinds[i] })),
+    human_idx: view.human_idx, explain: !!config.explain,
+    rounds: [], end: null,
+  };
+}
+
+const trimAdvice = (a) => ({
+  kind: a.kind, fair: a.fair, breakEven: a.breakEven, ceiling: a.ceiling ?? null, suggested: a.suggested,
+  winProb: a.winProb, verdict: a.verdict, reason: a.reason, cashValue: a.cashValue, rivalSource: a.rivalSource ?? "model",
+  rivals: (a.rivals || []).map((r) => ({ idx: r.idx, likely: r.likely, low: r.low ?? null, high: r.high ?? null })),
+  colorRows: a.colorRows.map((r) => ({ color: r.color, known: r.known, maxFinal: r.maxFinal, expDisplay: r.expDisplay, ev: r.ev, publicEv: r.publicEv, edge: r.edge })),
+});
+
+function recordRound(result) {
+  const d = game.decisions[result.round];
+  const entry = { round: result.round, state: game.snapshots[result.round] ?? null, result };
+  if (d) {
+    // The rival sample for this bid always lands before the bid's result
+    // (the worker answers in order), so this is the advice as shown.
+    let adv = null;
+    try { adv = advise(d.view, d.sim?.data ?? null); } catch (err) { console.error("EV coach failed:", err); }
+    Object.assign(entry, { max_bid: d.view.max_bid, coachShown: d.coachShown, advice: adv && trimAdvice(adv) });
+    delete game.decisions[result.round];
+  }
+  game.record.rounds.push(entry);
+  saveRecord(game.record);
+}
+
+function loadIndex() {
+  try { return JSON.parse(localStorage.getItem(LOG_INDEX_KEY)) || []; } catch (_) { return []; }
+}
+
+function logSummary(rec) {
+  const me = rec.human_idx;
+  let result = `unfinished after ${rec.rounds.length} round${rec.rounds.length === 1 ? "" : "s"}`;
+  if (rec.end) {
+    const totals = rec.end.scores.map((s) => s.total);
+    const top = Math.max(...totals);
+    if (me === null) result = `${rec.seats[totals.indexOf(top)]?.name ?? "?"} won with ${top}`;
+    else {
+      const rank = 1 + totals.filter((t) => t > totals[me]).length;
+      result = rank === 1 ? `you won with ${totals[me]}` : `you finished #${rank} with ${totals[me]}`;
+    }
+  }
+  return { id: rec.id, startedAt: rec.startedAt, seed: rec.seed, chart: rec.chart, players: rec.seats.length, mode: me === null ? "watch" : "play", finished: !!rec.end, result };
+}
+
+// Saved after every round, so an abandoned game is still there. If storage
+// is full, the oldest other games make room; if it's blocked, the game
+// still plays and can be downloaded from the end screen.
+function saveRecord(rec) {
+  rec.savedAt = new Date().toISOString();
+  const body = JSON.stringify(rec);
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      const index = [logSummary(rec), ...loadIndex().filter((g) => g.id !== rec.id)];
+      for (const old of index.splice(LOG_LIMIT)) localStorage.removeItem(LOG_GAME_KEY(old.id));
+      localStorage.setItem(LOG_GAME_KEY(rec.id), body);
+      localStorage.setItem(LOG_INDEX_KEY, JSON.stringify(index));
+      return true;
+    } catch (_) {
+      try {
+        const index = loadIndex();
+        const oldest = index.filter((g) => g.id !== rec.id).pop();
+        if (!oldest) return false;
+        localStorage.removeItem(LOG_GAME_KEY(oldest.id));
+        localStorage.setItem(LOG_INDEX_KEY, JSON.stringify(index.filter((g) => g.id !== oldest.id)));
+      } catch (_) { return false; }
+    }
+  }
+  return false;
+}
+
+function loadRecord(id) {
+  try { return JSON.parse(localStorage.getItem(LOG_GAME_KEY(id))); } catch (_) { return null; }
+}
+
+function deleteRecord(id) {
+  try {
+    localStorage.removeItem(LOG_GAME_KEY(id));
+    localStorage.setItem(LOG_INDEX_KEY, JSON.stringify(loadIndex().filter((g) => g.id !== id)));
+  } catch (_) { /* storage unavailable */ }
+}
+
+function downloadRecord(rec) {
+  const name = `megagem-${(rec.startedAt || "").slice(0, 10)}-chart${rec.chart}-${rec.seats.length}p-seed${rec.seed}.json`;
+  const url = URL.createObjectURL(new Blob([JSON.stringify(rec, null, 1)], { type: "application/json" }));
+  const a = Object.assign(document.createElement("a"), { href: url, download: name });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// A log may come from a file, so rebuild it field by field: numbers become
+// numbers, colours must be real colours, and every string is escaped when
+// rendered. Nothing in a loaded log can inject markup.
+const int = (x) => (Number.isFinite(Number(x)) ? Math.trunc(Number(x)) : 0);
+const real = (x, d = 0) => (Number.isFinite(Number(x)) ? Number(x) : d);
+const str = (x) => (x === null || x === undefined ? "" : String(x));
+const gemOf = (c) => (COLORS.includes(c) ? c : null);
+const gemsOf = (xs) => (Array.isArray(xs) ? xs.map(gemOf).filter(Boolean) : []);
+const countsOf = (o) => Object.fromEntries(COLORS.filter((c) => int(o?.[c]) > 0).map((c) => [c, int(o[c])]));
+const missionOf = (m) => ({ name: str(m?.name), coins: int(m?.coins), category: str(m?.category) });
+const auctionOf = (a) => (a?.kind === "treasure" ? { kind: "treasure", gems: int(a.gems) } : { kind: a?.kind === "loan" ? "loan" : "invest", amount: int(a?.amount) });
+const listOf = (xs, f) => (Array.isArray(xs) ? xs.map(f) : []);
+
+function cleanState(s) {
+  if (!s) return null;
+  const chart = CHARTS[s.value_chart] ? s.value_chart : "A";
+  return {
+    round_number: int(s.round_number), value_chart: chart, chart_values: [...CHARTS[chart].values],
+    auction_deck_count: int(s.auction_deck_count), gem_deck_count: int(s.gem_deck_count),
+    revealed_gems: gemsOf(s.revealed_gems), value_display: countsOf(s.value_display),
+    active_missions: listOf(s.active_missions, missionOf), last_winner_idx: s.last_winner_idx == null ? null : int(s.last_winner_idx),
+    players: listOf(s.players, (p) => ({
+      name: str(p?.name), coins: int(p?.coins), collection: countsOf(p?.collection), hand_size: int(p?.hand_size),
+      ...(Array.isArray(p?.hand) ? { hand: gemsOf(p.hand) } : {}),
+      completed_missions: listOf(p?.completed_missions, missionOf), loans: listOf(p?.loans, int),
+      investments: listOf(p?.investments, (x) => ({ amount: int(x?.amount), locked: int(x?.locked) })),
+    })),
+  };
+}
+
+function cleanResult(r) {
+  return {
+    round: int(r?.round), auction: auctionOf(r?.auction), bids: listOf(r?.bids, int), winner_idx: int(r?.winner_idx), winning_bid: int(r?.winning_bid),
+    taken_gems: gemsOf(r?.taken_gems), revealed_gem: gemOf(r?.revealed_gem),
+    completed_missions: listOf(r?.completed_missions, (m) => ({ player_idx: int(m?.player_idx), mission: missionOf(m?.mission) })),
+    ...(Array.isArray(r?.rationale) ? { rationale: r.rationale.map((x) => (x ? { ai_class: str(x.ai_class), lines: listOf(x.lines, str) } : null)) } : {}),
+  };
+}
+
+function cleanAdvice(a) {
+  if (!a) return null;
+  return {
+    kind: ["treasure", "invest", "loan"].includes(a.kind) ? a.kind : "treasure",
+    fair: real(a.fair), breakEven: int(a.breakEven), ceiling: a.ceiling == null ? null : int(a.ceiling), suggested: int(a.suggested),
+    winProb: a.winProb == null ? null : real(a.winProb), verdict: VERDICTS[a.verdict] ? a.verdict : "pass", reason: str(a.reason),
+    cashValue: real(a.cashValue, 1), rivalSource: a.rivalSource === "bots" ? "bots" : "model",
+    rivals: listOf(a.rivals, (r) => ({ idx: int(r?.idx), likely: int(r?.likely), low: r?.low == null ? null : int(r.low), high: r?.high == null ? null : int(r.high) })),
+    colorRows: listOf(a.colorRows, (c) => c).filter((c) => gemOf(c?.color)).map((c) => ({
+      color: c.color, known: int(c.known), maxFinal: int(c.maxFinal), expDisplay: real(c.expDisplay), ev: real(c.ev), publicEv: real(c.publicEv), edge: real(c.edge),
+    })),
+  };
+}
+
+function normalizeRecord(raw) {
+  if (!raw || raw.format !== "megagem-log" || !Array.isArray(raw.rounds) || !Array.isArray(raw.seats) || !raw.seats.length) {
+    throw new Error("That file isn't a MegaGem game log.");
+  }
+  const seats = raw.seats.map((s) => ({ name: str(s?.name), kind: str(s?.kind) }));
+  const me = raw.human_idx == null ? null : int(raw.human_idx);
+  return {
+    format: "megagem-log", version: 1, id: str(raw.id) || `import-${Date.now().toString(36)}`,
+    startedAt: str(raw.startedAt), savedAt: str(raw.savedAt), seed: int(raw.seed), chart: CHARTS[raw.chart] ? raw.chart : "A",
+    seats, human_idx: me !== null && me >= 0 && me < seats.length ? me : null, explain: !!raw.explain,
+    rounds: raw.rounds.map((e) => ({
+      round: int(e?.round), state: cleanState(e?.state), result: cleanResult(e?.result),
+      max_bid: e?.max_bid == null ? null : int(e.max_bid), coachShown: e?.coachShown == null ? null : !!e.coachShown, advice: cleanAdvice(e?.advice),
+    })),
+    end: raw.end ? {
+      state: cleanState(raw.end.state),
+      scores: listOf(raw.end.scores, (s) => ({
+        name: str(s?.name), coins: int(s?.coins), gem_value: int(s?.gem_value), mission_value: int(s?.mission_value),
+        loans_total: int(s?.loans_total), invest_returns: int(s?.invest_returns), total: int(s?.total),
+      })),
+      final_hands: listOf(raw.end.final_hands, gemsOf),
+    } : null,
+  };
+}
+
+// Past games (setup screen) -------------------------------------------------
+
+function renderPastGames() {
+  const index = loadIndex();
+  const when = (iso) => { const d = new Date(iso); return Number.isNaN(d.getTime()) ? "Unknown date" : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }); };
+  $("past-list").innerHTML = index.length
+    ? index.map((g) => `<div class="past-row">
+        <div class="past-info"><b>${esc(when(g.startedAt))}</b>
+          <span class="muted small">Chart ${esc(g.chart)} · ${int(g.players)} players · seed ${int(g.seed)}${g.mode === "watch" ? " · watched" : ""}</span></div>
+        <span class="past-result${g.finished ? "" : " muted"}">${esc(g.result)}</span>
+        <div class="past-actions">
+          <button type="button" class="btn sm" data-review="${esc(g.id)}">Review</button>
+          <button type="button" class="btn sm ghost" data-download="${esc(g.id)}">Download</button>
+          <button type="button" class="btn sm ghost" data-delete="${esc(g.id)}" aria-label="Delete this game">Delete</button>
+        </div></div>`).join("")
+    : '<p class="empty">No saved games yet. Every game you play or watch is saved here as it goes.</p>';
+  for (const b of $("past-list").querySelectorAll("[data-review]")) b.onclick = () => openSaved(b.dataset.review, (rec) => openReview(rec, "setup"));
+  for (const b of $("past-list").querySelectorAll("[data-download]")) b.onclick = () => openSaved(b.dataset.download, downloadRecord);
+  for (const b of $("past-list").querySelectorAll("[data-delete]")) {
+    b.onclick = () => { if (confirm("Delete this saved game?")) { deleteRecord(b.dataset.delete); renderPastGames(); } };
+  }
+}
+
+function openSaved(id, then) {
+  const raw = loadRecord(id);
+  if (!raw) return toast("That game is no longer in this browser's storage.", { error: true });
+  try { then(normalizeRecord(raw)); } catch (err) { toast(esc(err.message), { error: true }); }
+}
+
+async function openLogFile(file) {
+  try {
+    openReview(normalizeRecord(JSON.parse(await file.text())), "setup");
+  } catch (err) {
+    toast(`Couldn't open ${esc(file.name)}: ${esc(err instanceof SyntaxError ? "it isn't valid JSON" : err.message)}`, { error: true, ms: 6000 });
+  }
+}
+
+// Move-by-move review --------------------------------------------------------
+
+let review = null; // { record, idx, res, from }
+
+const stepCount = (rec) => rec.rounds.length + (rec.end ? 1 : 0);
+const seatName = (rec, k) => esc(rec.seats[k]?.name ?? `Seat ${k + 1}`);
+const kindLabel = (kind) => esc(kind === "human" ? "You" : BOT_BY_KIND[kind]?.label || kind);
+
+function openReview(rec, from) {
+  if (!stepCount(rec)) return toast("This game has no rounds to review yet.");
+  let res = null;
+  if (rec.end?.state) {
+    try {
+      res = analyze(
+        { phase: "game_over", human_idx: rec.human_idx, state: rec.end.state, scores: rec.end.scores, final_hands: rec.end.final_hands },
+        rec.rounds.map((e) => e.result),
+        Object.fromEntries(rec.rounds.filter((e) => e.state).map((e) => [e.round, e.state])),
+      );
+    } catch (err) { console.error("Review analysis failed:", err); }
+  }
+  review = { record: rec, idx: 0, res, from };
+  showScreen("review");
+  renderReview();
+}
+
+function stepReview(delta) {
+  if (!review) return;
+  const idx = Math.max(0, Math.min(stepCount(review.record) - 1, review.idx + delta));
+  if (idx !== review.idx) { review.idx = idx; renderReview(); }
+}
+
+function renderReview() {
+  const { record: rec, idx, res } = review;
+  const me = rec.human_idx;
+  const started = new Date(rec.startedAt);
+  $("rv-title").textContent = `Chart ${rec.chart} · ${rec.seats.length} players · seed ${rec.seed}`;
+  $("rv-sub").textContent = [Number.isNaN(started.getTime()) ? null : started.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }), logSummary(rec).result].filter(Boolean).join(" · ");
+  $("rv-hands-field").hidden = !rec.end;
+  $("rv-hands").checked = !!prefs.reviewHands;
+  $("rv-strip").innerHTML = rec.rounds.map((e, i) => {
+    const r = e.result, v = res?.rounds[i]?.verdict ? ROUND_VERDICTS[res.rounds[i].verdict][1] : "";
+    return `<button type="button" class="rv-step ${v}${i === idx ? " on" : ""}${r.winner_idx === me ? " won" : ""}" data-step="${i}"
+      title="Round ${r.round}: ${esc(auctionText(r.auction))}, ${seatName(rec, r.winner_idx)} won for ${r.winning_bid}">${r.round}</button>`;
+  }).join("") + (rec.end ? `<button type="button" class="rv-step rv-end${idx === rec.rounds.length ? " on" : ""}" data-step="${rec.rounds.length}">End</button>` : "");
+  for (const b of $("rv-strip").querySelectorAll("[data-step]")) b.onclick = () => { review.idx = Number(b.dataset.step); renderReview(); };
+  $("rv-strip").querySelector(".on")?.scrollIntoView({ block: "nearest", inline: "center" });
+  $("rv-prev").disabled = idx === 0;
+  $("rv-next").disabled = idx >= stepCount(rec) - 1;
+  $("rv-pos").textContent = idx < rec.rounds.length ? `Round ${rec.rounds[idx].round} of ${rec.rounds.length}` : "Final scores";
+
+  $("rv-body").innerHTML = idx < rec.rounds.length ? reviewRound(idx) : reviewEnd();
+  for (const el of $("rv-body").querySelectorAll("[data-market]")) {
+    const st = el.dataset.market === "end" ? rec.end.state : rec.rounds[idx].state;
+    renderMarket(el, st, me === null ? null : st.players[me], { final: el.dataset.market === "end" });
+  }
+}
+
+function reviewRound(i) {
+  const { record: rec, res } = review;
+  const e = rec.rounds[i], r = e.result, st = e.state, adv = e.advice, an = res?.rounds[i];
+  const me = rec.human_idx, a = r.auction;
+  const showHands = !!(rec.end && prefs.reviewHands && an?.hands);
+  const offered = st && a.kind === "treasure" ? st.revealed_gems.slice(0, a.gems) : r.taken_gems;
+  const parts = [];
+
+  // The lot and what happened.
+  const bids = r.bids.map((b, k) => `<span class="chip${k === r.winner_idx ? " win" : ""}">${seatName(rec, k)} ${b}</span>`).join("");
+  const missions = r.completed_missions.map((m) => `<span class="chip mission">★ ${seatName(rec, m.player_idx)}: ${esc(missionText(m.mission.name))} +${m.mission.coins}</span>`).join("");
+  const worth = an ? `<p class="muted small">In the end it was worth <b class="${signCls(an.surplus)}">${an.gross}</b> to ${seatName(rec, r.winner_idx)}: ${signed(an.surplus)} on the price.</p>` : "";
+  parts.push(`<section class="panel rv-lot">
+      <div class="panel-title">On the block <span>${esc(auctionText(a))}</span></div>
+      <div class="rv-lot-grid">
+        <div class="rv-offer ${a.kind}">${a.kind === "treasure"
+          ? `<div class="gem-row">${gemList(offered, "xl")}</div>`
+          : `<b>${esc(auctionText(a))}</b><span class="muted small">${a.kind === "loan" ? `Get ${a.amount} now, repay ${a.amount} at the end` : `Bid back plus ${a.amount} at the end`}</span>`}</div>
+        <div class="rv-outcome">
+          <p><b>${seatName(rec, r.winner_idx)}</b> won for ${coin(r.winning_bid)}${r.taken_gems.length ? ` and took ${gemList(r.taken_gems, "sm")}` : ""}.
+            ${r.revealed_gem ? `Revealed ${gem(r.revealed_gem, "sm")} from ${r.winner_idx === me ? "your" : "their"} hand.` : ""}</p>
+          <div class="log-bids">${bids}</div>
+          ${missions ? `<div class="gem-row">${missions}</div>` : ""}
+          ${worth}
+        </div>
+      </div>
+    </section>`);
+
+  // Your decision against the coach's at the time.
+  if (me !== null && adv) {
+    const v = an?.verdict ? ROUND_VERDICTS[an.verdict] : null;
+    const tiles = [
+      tile("Your bid", r.bids[me], "What you bid", r.winner_idx === me ? "main" : ""),
+      tile("Coach's bid", adv.suggested, "What the coach suggested at the time"),
+      adv.kind === "treasure" ? tile("Fair value", num1(adv.fair), "Expected worth from your seat at the time")
+        : adv.kind === "invest" ? tile("A win paid", `+${adv.fair}`, "Invest bonus") : tile("Coin value", `${adv.cashValue.toFixed(1)}×`, "What a coin was worth in later lots at the time"),
+      adv.winProb !== null && adv.suggested > 0 ? tile("Coach's win chance", `${Math.round(adv.winProb * 100)}%`, "At the coach's bid") : "",
+    ].join("");
+    const rivals = adv.rivals.length ? `<div class="coach-table-wrap"><table class="coach-table">
+        <thead><tr><th>Rival</th><th>${adv.rivalSource === "bots" ? "Bots' range" : "Coach expected"}</th><th>Actual bid</th>${showHands ? "<th>Hand then</th>" : ""}</tr></thead>
+        <tbody>${adv.rivals.map((x) => `<tr><td><b>${seatName(rec, x.idx)}</b></td>
+          <td>${x.low !== null && x.low !== x.high ? `${x.low}–${x.high}` : `~${x.likely}`}</td>
+          <td class="${r.bids[x.idx] > (x.high ?? x.likely) ? "neg" : r.bids[x.idx] < (x.low ?? x.likely) ? "pos" : ""}">${r.bids[x.idx]}</td>
+          ${showHands ? `<td><span class="gem-row">${gemList(an.hands[x.idx] || [], "sm")}</span></td>` : ""}</tr>`).join("")}</tbody></table></div>` : "";
+    parts.push(`<section class="panel rv-you">
+        <div class="panel-title">Your decision ${e.coachShown === false ? "<span>the coach was hidden at the time</span>" : ""}</div>
+        <div class="ctiles">${tiles}</div>
+        <p class="rv-reason"><span class="verdict ${VERDICTS[adv.verdict][1]}">${VERDICTS[adv.verdict][0]}</span> ${esc(adv.reason)}</p>
+        ${v ? `<p class="rv-verdict"><span class="chip ${v[1]}">${v[0]}</span> ${esc(an.note)}</p>` : ""}
+        ${rivals}
+      </section>`);
+  } else if (an) {
+    parts.push(`<section class="panel rv-you">
+        <div class="panel-title">Each seat's view <span>fair value from its own hand at the time</span></div>
+        <div class="coach-table-wrap"><table class="coach-table"><thead><tr><th>Player</th><th>Fair value</th><th>Bid</th></tr></thead>
+        <tbody>${an.fair.map((f, k) => `<tr><td><b>${seatName(rec, k)}</b></td><td>${a.kind === "treasure" ? num1(f) : "—"}</td><td>${r.bids[k]}</td></tr>`).join("")}</tbody></table></div>
+      </section>`);
+  }
+
+  // The table as it stood before the bids.
+  if (st) {
+    const seats = st.players.map((p, k) => {
+      const hand = k === me && p.hand ? gemList(p.hand, "sm")
+        : showHands ? gemList(an.hands[k] || [], "sm")
+        : `<span class="hand-backs" title="${p.hand_size} gems in hand">${"<i></i>".repeat(p.hand_size)}</span>`;
+      const extras = [
+        ...p.loans.map((x) => `<span class="chip loan">Loan −${x}</span>`),
+        ...p.investments.map((x) => `<span class="chip invest">Invest ${x.locked}+${x.amount}</span>`),
+        ...p.completed_missions.map((m) => `<span class="chip mission" title="${esc(m.name)}">★ +${m.coins}</span>`),
+      ].join("");
+      return `<div class="rv-seat${k === me ? " you" : ""}${k === r.winner_idx ? " winner" : ""}">
+          <div class="seat-card-head"><b>${seatName(rec, k)}</b> ${coin(p.coins)}</div>
+          <div class="stats"><span>Hand</span><span class="gem-row">${hand}</span></div>
+          <div class="stats"><span>Collected</span><span class="gem-row">${gemCounts(p.collection)}</span></div>
+          ${extras ? `<div class="stats">${extras}</div>` : ""}
+        </div>`;
+    }).join("");
+    parts.push(`<section class="panel">
+        <div class="panel-title">The table before bidding <span>${showHands ? "every hand shown" : "hands as you saw them"}</span></div>
+        <div class="rv-seats">${seats}</div>
+        <div class="market-cols rv-market" data-market="${i}"></div>
+      </section>`);
+  }
+
+  // What the coach expected for each colour, against how it ended.
+  if (adv?.colorRows.length) {
+    const fin = rec.end?.state;
+    parts.push(`<section class="panel">
+        <div class="panel-title">Per-colour view at the time ${fin ? "<span>against how it ended</span>" : ""}</div>
+        <div class="coach-table-wrap"><table class="coach-table">
+          <thead><tr><th>Colour</th><th>Expected final display</th><th>EV/gem</th><th>Edge</th>${fin ? "<th>Final display</th><th>Final worth</th>" : ""}</tr></thead>
+          <tbody>${adv.colorRows.map((c) => `<tr>
+            <td>${gem(c.color, "sm")} <span class="hide-sm">${c.color}</span></td>
+            <td>${num1(c.expDisplay)} <span class="muted">(${c.known}–${c.maxFinal})</span></td>
+            <td><b>${num1(c.ev)}</b></td>
+            <td class="${signCls(Math.round(c.edge * 10))}">${Math.abs(c.edge) < 0.05 ? "0" : signed(c.edge, 1)}</td>
+            ${fin ? `<td>${fin.value_display[c.color] || 0}</td><td><b>${chartValue(fin.value_chart, fin.value_display[c.color] || 0)}</b></td>` : ""}
+          </tr>`).join("")}</tbody></table></div>
+      </section>`);
+  }
+
+  if (r.rationale?.some(Boolean)) {
+    parts.push(`<section class="panel"><details><summary class="rv-summary">Bot reasoning</summary><div class="rationale">${r.rationale.map((x, k) => x
+      ? `<div><b>${seatName(rec, k)}</b> <span class="muted small">${esc(x.ai_class)} · bid ${r.bids[k]}</span><pre>${esc(x.lines.join("\n") || "(no detail)")}</pre></div>`
+      : "").join("")}</div></details></section>`);
+  }
+  return parts.join("");
+}
+
+function reviewEnd() {
+  const { record: rec, res } = review;
+  const me = rec.human_idx, end = rec.end;
+  const rows = end.scores.map((s, i) => ({ ...s, i })).sort((x, y) => y.total - x.total);
+  let rank = 0, prev = null;
+  const body = rows.map((s, n) => {
+    if (s.total !== prev) { rank = n + 1; prev = s.total; }
+    const p = res?.players[s.i];
+    return `<tr class="${rank === 1 ? "first" : ""}${s.i === me ? " me" : ""}">
+      <td><span class="rank">${rank}</span><b>${seatName(rec, s.i)}</b> ${s.i === me ? "" : `<span class="chip kind">${kindLabel(rec.seats[s.i]?.kind)}</span>`}
+        ${end.final_hands[s.i]?.length ? `<div class="gem-row" style="margin-top:4px"><span class="muted small">hand</span>${gemList(end.final_hands[s.i], "sm")}</div>` : ""}</td>
+      <td>${s.coins}</td><td>${s.gem_value}</td><td>${s.mission_value}</td>
+      <td class="${s.invest_returns ? "pos" : ""}">${s.invest_returns ? "+" + s.invest_returns : 0}</td>
+      <td class="${s.loans_total ? "neg" : ""}">${s.loans_total ? "−" + s.loans_total : 0}</td>
+      <td class="${p ? signCls(p.surplus) : ""}">${p ? signed(p.surplus) : "—"}</td>
+      <td class="total">${s.total}</td></tr>`;
+  }).join("");
+  const you = res?.summary;
+  return `<section class="panel">
+      <div class="panel-title">Final scores</div>
+      ${you ? `<p class="an-identity">Your score = <b>${res.start}</b> starting coins <b class="${signCls(you.you.surplus)}">${signed(you.you.surplus)}</b> surplus = <b>${you.you.score}</b>.</p>` : ""}
+      <div class="score-table-wrap"><table class="score-table">
+        <thead><tr><th>Player</th><th>Coins</th><th>Gems</th><th>Missions</th><th>Invest</th><th>Loans</th><th>Surplus</th><th>Total</th></tr></thead>
+        <tbody>${body}</tbody></table></div>
+    </section>
+    <section class="panel"><div class="panel-title">Final value display</div><div class="market-cols" data-market="end"></div></section>`;
+}
+
+// --------------------------------------------------------------------------
 // Boot
 // --------------------------------------------------------------------------
 
@@ -986,6 +1456,7 @@ engine.onStatus = renderEngineStatus;
 renderEngineStatus(engine.status, "Starting the Python engine…");
 wireSetup();
 renderSetup();
+renderPastGames();
 
 $("nav-quit").onclick = quitGame;
 $("end-setup").onclick = () => { game = null; showScreen("setup"); };
@@ -993,8 +1464,19 @@ $("sp-step").onclick = () => { stopAuto(); act("step"); };
 $("sp-auto").onclick = toggleAuto;
 $("sp-speed").onchange = () => { if (game?.auto && !game.busy) scheduleAuto(); };
 $("g-coach-btn").onclick = toggleCoach;
+$("rv-prev").onclick = () => stepReview(-1);
+$("rv-next").onclick = () => stepReview(1);
+$("rv-close").onclick = () => showScreen(review?.from === "end" && game?.view?.phase === "game_over" ? "end" : "setup");
+$("rv-download").onclick = () => review && downloadRecord(review.record);
+$("rv-hands").onchange = (e) => { prefs.reviewHands = e.target.checked; savePrefs(); renderReview(); };
+$("past-file").onchange = (e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) openLogFile(f); };
 
 document.addEventListener("keydown", (e) => {
+  if (!$("screen-review").hidden && !e.target.matches("input, select, textarea")) {
+    if (e.key === "ArrowLeft") { e.preventDefault(); stepReview(-1); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); stepReview(1); }
+    return;
+  }
   if (!game || $("screen-game").hidden || e.target.matches("input, select, textarea")) return;
   const phase = game.view?.phase;
   if (phase === "ready" || (game.auto && game.busy)) {

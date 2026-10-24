@@ -107,6 +107,12 @@
                 </div>
             </aside>
         </div>
+
+        <section class="panel past-games">
+            <div class="panel-title">Past games <span>saved in this browser as you play</span></div>
+            <div id="past-list" class="past-list"></div>
+            <label class="btn sm ghost file-btn">Open a downloaded log…<input id="past-file" type="file" accept=".json,application/json" hidden></label>
+        </section>
     </main>
 
     <!-- ============================ GAME ============================= -->
@@ -220,10 +226,40 @@
                 <div id="end-market" class="market-cols"></div>
             </section>
             <div class="end-actions">
+                <button id="end-review" class="btn gold lg" type="button">Review move by move</button>
+                <button id="end-download" class="btn lg" type="button">Download game log</button>
+            </div>
+            <div class="end-actions">
                 <button id="end-rematch" class="btn primary lg" type="button">Rematch (same seed)</button>
                 <button id="end-again" class="btn lg" type="button">New deal</button>
                 <button id="end-setup" class="btn ghost lg" type="button">Change settings</button>
             </div>
+        </div>
+    </main>
+
+    <!-- ============================ REVIEW =========================== -->
+    <main id="screen-review" class="wrap" hidden>
+        <div class="review">
+            <div class="review-head">
+                <div>
+                    <h2 id="rv-title">Game review</h2>
+                    <p id="rv-sub" class="muted" style="margin:0"></p>
+                </div>
+                <div class="review-actions">
+                    <button id="rv-download" class="btn sm" type="button">Download log</button>
+                    <button id="rv-close" class="btn sm ghost" type="button">Close</button>
+                </div>
+            </div>
+            <section class="panel rv-nav">
+                <div class="rv-nav-row">
+                    <button id="rv-prev" class="btn sm" type="button" title="Previous round (← key)">← Prev</button>
+                    <b id="rv-pos"></b>
+                    <button id="rv-next" class="btn sm" type="button" title="Next round (→ key)">Next →</button>
+                    <label class="check" id="rv-hands-field"><input id="rv-hands" type="checkbox"> Show everyone's hands</label>
+                </div>
+                <div id="rv-strip" class="rv-strip" role="group" aria-label="Rounds"></div>
+            </section>
+            <div id="rv-body" class="rv-body"></div>
         </div>
     </main>
 
