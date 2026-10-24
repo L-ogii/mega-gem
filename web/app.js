@@ -827,7 +827,7 @@ function renderCoach() {
     tiles.push(tile("Reserve", adv.reserve, "Rough cash the remaining lots call for"));
   }
   tiles.push(tile("Suggested bid", adv.suggested, "The coach's bid", "main"));
-  if (adv.winProb !== null && adv.suggested > 0) tiles.push(tile("Win chance", `${Math.round(adv.winProb * 100)}%`, "Estimated from public information"));
+  if (adv.winProb !== null && adv.suggested > 0) tiles.push(tile("Win chance", adv.winProb > 0 && adv.winProb < 0.005 ? "<1%" : `${Math.round(adv.winProb * 100)}%`, "Estimated from public information"));
 
   const parts = [`<div class="coach-head">
       <div class="ctiles">${tiles.join("")}</div>

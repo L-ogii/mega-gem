@@ -31,14 +31,12 @@ const CASH_VALUE_MAX = 2;
 const MISSION_SHARE = 0.5; // open-mission coins expected to be claimed, for valuing cash
 const LOAN_LIQUIDITY_SHARE = 1;
 const LOAN_BID_MAX = 6;
-// Below this win chance a bid is a lottery ticket, not advice: say pass.
-const MIN_WIN_CHANCE = 0.05;
 
 const chartAt = (values, n) => values[Math.min(Math.max(n, 0), 5)];
 const sum = (xs) => xs.reduce((s, x) => s + x, 0);
 const countColors = (colors) => colors.reduce((m, c) => ((m[c] = (m[c] || 0) + 1), m), {});
 const fmt = (x) => String(Math.round(x * 10) / 10);
-const pct = (p) => `${Math.round(p * 100)}%`;
+const pct = (p) => (p > 0 && p < 0.005 ? "under 1%" : `${Math.round(p * 100)}%`);
 
 export function lotText(a) {
   if (a.kind === "treasure") return `Treasure ×${a.gems}`;
@@ -353,6 +351,19 @@ function adviseTreasure(st, a, me, cap, mine, pub, ties, lambda, sim) {
     const e = (fair - lambda * b) * p;
     if (e > best.e + 1e-9) best = { bid: b, e, p };
   }
+  // A losing sealed bid costs nothing, so whenever some bid would still
+  // profit if it won, name one: a long shot beats a 0, which only wins if
+  // everyone else forgets to bid (and human rivals do underbid).
+  const hi = Math.min(cap, ceiling);
+  if (offered.length && fair >= 1 && hi >= 1 && best.bid === 0 && best.p < 0.5) {
+    best = { bid: 0, e: -Infinity, p: 0 };
+    for (let b = 1; b <= hi; b++) {
+      const p = chance(b);
+      const e = (fair - lambda * b) * p;
+      if (e > best.e + 1e-9) best = { bid: b, e, p };
+    }
+    if (best.e <= 1e-9) best = { bid: Math.max(1, Math.floor(hi / 2)), p: chance(Math.max(1, Math.floor(hi / 2))) };
+  }
 
   let suggested = best.bid, verdict, reason;
   const net = fair - lambda * best.bid;
@@ -361,13 +372,11 @@ function adviseTreasure(st, a, me, cap, mine, pub, ties, lambda, sim) {
   if (!offered.length) {
     suggested = 0; verdict = "pass";
     reason = "No gems are left on the row, so this lot is worth nothing. Bid 0.";
-  } else if (fair < 1 || best.bid === 0 || best.e < 0.25 || best.p < MIN_WIN_CHANCE) {
+  } else if (fair < 1 || hi < 1) {
     suggested = 0; verdict = "pass";
-    reason = fair < 1
-      ? `Worth only ~${fmt(fair)} to you. Bid 0.`
-      : short && cap < needed
-        ? `Worth ~${fmt(fair)} to you, but you can only bid ${cap}, well under ${vsTop}. Bid 0 and keep your coins for a lot you can win.`
-        : `Rivals likely bid more than the ~${ceiling} it's worth paying: ${vsTop}. Bid 0 and keep your coins.`;
+    reason = fair < 1 ? `Worth only ~${fmt(fair)} to you. Bid 0.`
+      : cap < 1 ? "You have no coins to bid. Bid 0."
+      : `Worth ~${fmt(fair)} to you, but a coin is worth ~${fmt(lambda)} in later lots right now, so even 1 coin costs more than this returns. Bid 0.`;
   } else if (best.p >= 0.5) {
     verdict = net >= Math.max(2, 0.2 * fair) ? "buy" : "thin";
     reason = `${short && suggested === cap ? `All in at ${suggested}` : `Bid ${suggested}`}: about ${pct(best.p)} to beat ${vsTop}. `
@@ -378,7 +387,7 @@ function adviseTreasure(st, a, me, cap, mine, pub, ties, lambda, sim) {
     verdict = "shot";
     reason = short && suggested === cap
       ? `You can only bid ${cap}, so it's a long shot: ${pct(best.p)} to beat ${vsTop}. Nets ~${fmt(fair - suggested)} if it lands.`
-      : `Bid ${suggested} as a cheap shot: ${pct(best.p)} to win against ${vsTop}. Nets ~${fmt(fair - suggested)} if it lands; bidding more costs more than the extra win chance is worth.`;
+      : `Rivals will probably bid more: ${vsTop}. A losing bid costs nothing, though. Bid ${suggested}: ${pct(best.p)} to win, and it nets ~${fmt(fair - suggested)} if they slip.`;
   }
 
   const p = suggested === best.bid ? best.p : chance(suggested);
@@ -414,15 +423,27 @@ function adviseInvest(st, a, me, cap, pub, ties, lambda, spare, sim) {
     const score = p * (a.amount - (lambda - 1) * (b + Math.max(0, b - spare))) - 0.01 * b;
     if (score > best.score + 1e-9) best = { bid: b, score, p };
   }
-  if (best.p < MIN_WIN_CHANCE) best = { bid: 0, p: chance(0) };
+  // As with treasure: when a win at some positive bid is still worth more
+  // than the cash it locks, name that bid rather than a 0 that rarely wins.
+  const worthIt = (b) => a.amount - (lambda - 1) * (b + Math.max(0, b - spare)) > 0;
+  if (best.bid === 0 && best.p < 0.5 && cap >= 1 && worthIt(1)) {
+    best = { bid: 1, score: -Infinity, p: 0 };
+    for (let b = 1; b <= cap && worthIt(b); b++) {
+      const p = chance(b);
+      const score = p * (a.amount - (lambda - 1) * (b + Math.max(0, b - spare))) - 0.01 * b;
+      if (score > best.score + 1e-9) best = { bid: b, score, p };
+    }
+  }
   const suggested = best.bid;
   const verdict = suggested === 0 ? "pass" : best.p >= 0.5 ? "buy" : "shot";
   const lead = `Invest pays back your bid plus ${a.amount}, so a win is +${a.amount} at any price; the cost is cash locked until the end.`;
   const reason = cap === 0
     ? `${lead} You have no coins to lock, so bid 0.`
     : suggested === 0
-      ? `${lead} Beating ${top.name}'s ${sampled ? "" : "est. "}~${top.likely} would lock more buying power than the +${a.amount} is worth. Bid 0.`
-      : `${lead} Bid ${suggested}: about ${pct(best.p)} to beat ${top.name}'s ${sampled ? "" : "est. "}~${top.likely} (${tieNote(top)}).`;
+      ? `${lead} Locking even 1 coin costs more buying power than the +${a.amount} is worth right now. Bid 0.`
+      : best.p >= 0.5
+        ? `${lead} Bid ${suggested}: about ${pct(best.p)} to beat ${top.name}'s ${sampled ? "" : "est. "}~${top.likely} (${tieNote(top)}).`
+        : `${lead} Rivals will probably bid more: ${top.name}'s ${sampled ? "" : "est. "}~${top.likely}. A losing bid costs nothing, though: bid ${suggested} for a ${pct(best.p)} chance at +${a.amount}.`;
   return {
     fair: a.amount, breakEven: cap, needed,
     rivals: rivals.map(({ pmf, ...r }) => r), rivalSource: sampled ? "bots" : "model",
@@ -448,7 +469,7 @@ function adviseLoan(st, a, me, cap, ties, lambda, reserve, sim) {
       const q = chance(b), e = (liquidity - b) * q;
       if (e > best.e + 1e-9) best = { bid: b, e, p: q };
     }
-    suggested = best.p < MIN_WIN_CHANCE ? 0 : best.bid;
+    suggested = best.bid;
     p = chance(suggested);
   }
   const top = topRival(rivals);
