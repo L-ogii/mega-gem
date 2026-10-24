@@ -3,6 +3,10 @@
 // All game logic runs in engine-worker.js (Pyodide + the canonical
 // research/megagem package). This file only renders the views that
 // megagem.browser.BrowserSession returns and sends back bids/reveals.
+// The EV coach (coach.js) is pure JS over those same views and never
+// talks to the worker.
+
+import { advise, analyze } from "./coach.js?v=__MEGAGEM_BUILD__";
 
 const COLORS = ["Blue", "Green", "Pink", "Purple", "Yellow"];
 const COLOR_HEX = { Blue: "#4f9bff", Green: "#33d68b", Pink: "#ff5fae", Purple: "#a875ff", Yellow: "#ffcc3d" };
@@ -135,7 +139,7 @@ class Engine {
 // --------------------------------------------------------------------------
 
 const PREFS_KEY = "megagem.prefs.v2";
-const defaultPrefs = { mode: "play", players: 4, name: "", chart: "A", explain: false, bots: ["evo4", "evo4", "evo4", "evo4", "evo4"] };
+const defaultPrefs = { mode: "play", players: 4, name: "", chart: "A", explain: false, coach: true, coachColors: true, bots: ["evo4", "evo4", "evo4", "evo4", "evo4"] };
 
 function loadPrefs() {
   try {
@@ -154,7 +158,7 @@ function savePrefs() {
 
 const engine = new Engine();
 const prefs = loadPrefs();
-let game = null; // { config, view, token, busy, auto, autoTimer }
+let game = null; // { config, view, token, busy, auto, autoTimer, log, snapshots, advice }
 let gameToken = 0;
 
 function showScreen(name) {
@@ -197,8 +201,10 @@ function renderSetup() {
   seg("mode-seg", prefs.mode, (v) => { prefs.mode = v; savePrefs(); renderSetup(); });
   seg("players-seg", prefs.players, (v) => { prefs.players = Number(v); savePrefs(); renderSetup(); });
   $("name-field").hidden = prefs.mode !== "play";
+  $("coach-field").hidden = prefs.mode !== "play";
   $("setup-name").value = prefs.name;
   $("setup-explain").checked = prefs.explain;
+  $("setup-coach").checked = prefs.coach;
 
   const rows = [];
   let botIdx = 0;
@@ -255,6 +261,7 @@ function wireSetup() {
     if (you) you.firstChild.textContent = prefs.name || "You";
   });
   $("setup-explain").addEventListener("change", (e) => { prefs.explain = e.target.checked; savePrefs(); });
+  $("setup-coach").addEventListener("change", (e) => { prefs.coach = e.target.checked; savePrefs(); });
   $("setup-all").addEventListener("change", (e) => {
     if (!e.target.value) return;
     prefs.bots = prefs.bots.map(() => e.target.value);
@@ -283,7 +290,7 @@ function renderEngineStatus(status, detail) {
 async function startGame(config) {
   stopAuto();
   const token = ++gameToken;
-  game = { config, view: null, token, busy: true, auto: false, autoTimer: null, log: [] };
+  game = { config, view: null, token, busy: true, auto: false, autoTimer: null, log: [], snapshots: {}, advice: null };
   hideToast();
   $("g-log").innerHTML = "";
   showScreen("game");
@@ -305,6 +312,7 @@ async function act(cmd, args) {
   const token = game.token;
   game.busy = true;
   renderAction();
+  $("g-coach").classList.add("stale");
   try {
     const view = await engine.call(cmd, args);
     if (token !== gameToken) return;
@@ -321,6 +329,9 @@ async function act(cmd, args) {
 function handleView(view) {
   game.view = view;
   game.busy = false;
+  // The table as seen at bid time, keyed by the round about to be played,
+  // so the end-screen analysis can value each lot from every seat.
+  if (view.phase === "bid" || view.phase === "ready") game.snapshots[view.state.round_number + 1] = structuredClone(view.state);
   if (view.last_round) {
     game.log.push(view.last_round);
     appendLog(view.last_round, view);
@@ -438,6 +449,8 @@ function renderLoadingTable() {
   $("g-missions").innerHTML = "";
   $("g-you").hidden = true;
   $("g-spectate").hidden = true;
+  $("g-coach").hidden = true;
+  $("g-coach-btn").hidden = true;
   $("g-log-count").textContent = "";
 }
 
@@ -464,6 +477,7 @@ function renderGame() {
   $("g-spectate").hidden = !spectator;
   if (!spectator) renderYou();
   renderAction();
+  renderCoach();
   $("g-log-count").textContent = game.log.length ? `${game.log.length} played` : "";
 }
 
@@ -629,6 +643,8 @@ function renderBid(el) {
     hint = `Your bid is a cost: the ${a.amount} you receive is repaid at the end. Worth it only if you need cash now.`;
   }
   const quick = [...new Set([0, 1, Math.round(max / 4), Math.round(max / 2), max])].filter((v) => v <= max);
+  const adv = prefs.coach ? adviceFor(view) : null;
+  const coachQuick = adv ? `<button type="button" class="btn sm coach-q" data-q="${adv.suggested}" title="EV coach suggestion">Coach ${adv.suggested}</button>` : "";
   el.classList.add("live");
   el.innerHTML = `<h3>Your sealed bid</h3>
     <p class="muted small" style="margin:0">${hint}</p>
@@ -637,7 +653,7 @@ function renderBid(el) {
       <span class="of">of ${max} max${a.kind === "loan" ? ` (${me.coins} + loan)` : ""}</span>
     </div>
     <input id="bid-range" type="range" min="0" max="${max}" value="0" aria-label="Bid slider">
-    <div class="quick">${quick.map((v) => `<button type="button" class="btn sm ghost" data-q="${v}">${v === max ? `All in (${v})` : v}</button>`).join("")}</div>
+    <div class="quick">${coachQuick}${quick.map((v) => `<button type="button" class="btn sm ghost" data-q="${v}">${v === max ? `All in (${v})` : v}</button>`).join("")}</div>
     <button id="bid-go" type="button" class="btn primary lg block">Bid 0 <span class="kbd">Enter</span></button>`;
   const num = $("bid-num"), range = $("bid-range"), go = $("bid-go");
   const set = (v) => {
@@ -645,6 +661,7 @@ function renderBid(el) {
     num.value = v; range.value = v;
     go.innerHTML = `Bid ${v} <span class="kbd">Enter</span>`;
   };
+  setBid = set;
   num.oninput = () => set(num.value);
   range.oninput = () => set(range.value);
   for (const b of el.querySelectorAll("[data-q]")) b.onclick = () => set(b.dataset.q);
@@ -671,6 +688,147 @@ function renderReveal(el) {
         <span><b>${c}</b><br><span class="delta">worth <b>${before}</b> → <b class="${cls}">${after}</b> each · your ${owned} collected: <b class="${cls}">${swing >= 0 ? "+" : ""}${swing}</b></span></span></button>`;
     }).join("")}</div>`;
   for (const b of el.querySelectorAll("[data-color]")) b.onclick = () => act("reveal", { color: b.dataset.color });
+}
+
+// --------------------------------------------------------------------------
+// EV coach (play mode, bid phase)
+// --------------------------------------------------------------------------
+
+const num1 = (x) => (x === null || x === undefined ? "—" : x.toFixed(1));
+const signed = (x, digits = 0) => `${x > 0 ? "+" : x < 0 ? "−" : ""}${Math.abs(x).toFixed(digits)}`;
+const signCls = (x) => (x > 0 ? "pos" : x < 0 ? "neg" : "");
+const VERDICTS = { buy: ["Buy", "pos"], thin: ["Thin margin", "warn"], shot: ["Long shot", "info"], pass: ["Pass", "muted"] };
+
+let setBid = null; // renderBid's setter, so the coach can fill the bid box
+
+// One advise() per view. The coach is an add-on: if it throws, log it and
+// carry on without it rather than breaking the game.
+function adviceFor(view) {
+  if (game.advice?.view !== view) {
+    let adv = null;
+    try { adv = advise(view); } catch (err) { console.error("EV coach failed:", err); }
+    game.advice = { view, adv };
+  }
+  return game.advice.adv;
+}
+
+function toggleCoach() {
+  prefs.coach = !prefs.coach;
+  savePrefs();
+  if (!game?.view) return;
+  const typed = $("bid-num")?.value; // keep a half-entered bid across the re-render
+  renderAction();
+  if (typed !== undefined && game.view.phase === "bid" && !game.busy) setBid?.(typed);
+  renderCoach();
+}
+
+const tile = (label, value, title, cls = "") => `<div class="ctile ${cls}" title="${esc(title)}"><span>${label}</span><b>${value}</b></div>`;
+const tieText = (t) => (t === true ? "you win" : t === false ? "they win" : "random");
+
+function renderCoach() {
+  const { view } = game;
+  const btn = $("g-coach-btn");
+  btn.hidden = view.human_idx === null;
+  btn.setAttribute("aria-pressed", String(prefs.coach));
+  btn.textContent = prefs.coach ? "Coach: on" : "Coach: off";
+  const el = $("g-coach");
+  el.classList.remove("stale");
+  const adv = prefs.coach && view.human_idx !== null && view.phase === "bid" ? adviceFor(view) : null;
+  el.hidden = !adv;
+  if (!adv) return;
+
+  const [vLabel, vCls] = VERDICTS[adv.verdict];
+  const tiles = [];
+  if (adv.kind === "treasure") {
+    tiles.push(tile("Fair value", num1(adv.fair), "Expected final worth of these gems from your seat, plus any mission this lot completes for you"));
+    tiles.push(tile("Break-even", adv.breakEven, "Highest bid that still profits at face value"));
+    if (adv.cashValue > 1.05) tiles.push(tile("Worth paying", `≤ ${adv.ceiling}`, "Break-even after charging each coin at its current value"));
+  } else if (adv.kind === "invest") {
+    tiles.push(tile("A win pays", `+${adv.fair}`, "Your bid comes back at the end, plus the bonus"));
+    tiles.push(tile("Spare cash", adv.spare, `Coins above a ~${adv.reserve} reserve for later lots`));
+  } else {
+    tiles.push(tile("Your coins", adv.coins, "Coins you hold before the loan"));
+    tiles.push(tile("Reserve", adv.reserve, "Rough cash the remaining lots call for"));
+  }
+  tiles.push(tile("Suggested bid", adv.suggested, "The coach's bid", "main"));
+  if (adv.winProb !== null && adv.suggested > 0) tiles.push(tile("Win chance", `${Math.round(adv.winProb * 100)}%`, "Estimated from public information"));
+
+  const parts = [`<div class="coach-head">
+      <div class="ctiles">${tiles.join("")}</div>
+      <div class="coach-call">
+        <span class="verdict ${vCls}">${vLabel}</span>
+        <p>${esc(adv.reason)}</p>
+        <button id="coach-use" type="button" class="btn sm primary">Use suggested bid (${adv.suggested})</button>
+      </div>
+    </div>`];
+  if (adv.cashValue > 1.05) {
+    parts.push(`<p class="coach-note">Coins are worth about <b>${adv.cashValue.toFixed(1)}×</b> right now: roughly ${Math.round(adv.futureValue)} coins of value
+      is still to be auctioned against ${adv.cashInPlay} coins in play, so the coach charges every coin you pay at that rate.</p>`);
+  }
+  if (adv.kind === "treasure") parts.push(coachTreasure(adv));
+  else if (adv.kind === "invest") parts.push(coachRivals(adv, false));
+  parts.push(coachColors(adv));
+  $("g-coach-body").innerHTML = parts.join("");
+
+  $("coach-use").onclick = () => {
+    setBid?.(adv.suggested);
+    $("g-action").scrollIntoView({ block: "nearest", behavior: "smooth" });
+  };
+  $("coach-colors").ontoggle = (e) => { prefs.coachColors = e.target.open; savePrefs(); };
+}
+
+function coachTreasure(adv) {
+  const byColor = Object.fromEntries(adv.colorRows.map((r) => [r.color, r]));
+  const gems = adv.offered.map((c) => `<span class="lot-gem">${gem(c, "sm")}<b>${num1(byColor[c].ev)}</b><span class="muted">now ${byColor[c].valueNow}</span></span>`).join("");
+  const missions = adv.missions.map((m) => `<span class="chip mission">★ ${esc(missionText(m.name))} +${m.coins}</span>`).join("");
+  const edge = Math.abs(adv.edge) >= 0.5
+    ? `<span class="${signCls(adv.edge)}">Your hand moves this lot ${signed(adv.edge, 1)}</span> against the public estimate of ${num1(adv.publicGemsEv)}.`
+    : `Public estimate ${num1(adv.publicGemsEv)}: your hand adds nothing here.`;
+  const notes = [
+    ...adv.setsUp.map((m) => `<li>Sets you up: one gem from <b>${esc(missionText(m.name))}</b> (+${m.coins}).</li>`),
+    ...adv.denial.map((d) => `<li>Denial: this lot would complete <b>${esc(missionText(d.name))}</b> (+${d.coins}) for ${esc(d.rival)}.</li>`),
+  ];
+  return `<div class="coach-lot">
+      <div class="gem-row">${gems || '<span class="empty">no gems</span>'}${missions}</div>
+      <p class="muted small">EV per gem from your seat, against its value at today's display. ${edge}</p>
+      ${notes.length ? `<ul class="coach-notes">${notes.join("")}</ul>` : ""}
+    </div>${coachRivals(adv, true)}`;
+}
+
+function coachRivals(adv, treasure) {
+  const rows = adv.rivals.map((r) => `<tr>
+      <td><b>${esc(r.name)}</b></td>
+      <td>${coin(r.coins)}</td>
+      ${treasure ? `<td>${num1(r.value)}${r.missions.length ? ` <span class="chip mission" title="${esc(r.missions.map((m) => m.name).join(", "))}">★ +${r.missions.reduce((s, m) => s + m.coins, 0)}</span>` : ""}</td>` : ""}
+      <td>~${r.likely}</td>
+      <td class="${r.youWinTie === true ? "pos" : r.youWinTie === false ? "neg" : ""}">${tieText(r.youWinTie)}</td>
+    </tr>`).join("");
+  return `<div class="coach-table-wrap"><table class="coach-table">
+      <thead><tr><th>Rival</th><th>Cash</th>${treasure ? "<th>Est. value</th>" : ""}<th>Likely bid</th><th>Ties</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <p class="muted small">Rival figures are estimates from public information: each rival also knows its own hand.${adv.firstAuction ? " First auction, so ties are broken at random." : ""}</p>`;
+}
+
+function coachColors(adv) {
+  const rows = adv.colorRows.map((r) => {
+    const bars = r.probs.map((p, d) => `<i style="height:${Math.max(p > 0 ? 8 : 0, Math.round(p * 100))}%" title="${d} in display: ${Math.round(p * 100)}%"></i>`).join("");
+    const big = Math.abs(r.edge) >= 1.5 ? " big" : "";
+    return `<tr>
+      <td>${gem(r.color, "sm")} <span class="hide-sm">${r.color}</span></td>
+      <td>${num1(r.expDisplay)} <span class="muted">(${r.known}–${r.maxFinal})</span></td>
+      <td><span class="pbars" aria-hidden="true">${bars}</span></td>
+      <td><b>${num1(r.ev)}</b></td>
+      <td>${r.valueNow}</td>
+      <td class="edge ${signCls(Math.round(r.edge * 10))}${big}" title="Per-gem EV from your seat minus the public view's">${Math.abs(r.edge) < 0.05 ? "0" : signed(r.edge, 1)}</td>
+    </tr>`;
+  }).join("");
+  return `<details id="coach-colors" class="coach-colors"${prefs.coachColors ? " open" : ""}>
+      <summary>Per-colour expected value</summary>
+      <div class="coach-table-wrap"><table class="coach-table colors">
+        <thead><tr><th>Colour</th><th title="Expected final display count (guaranteed minimum–maximum)">Final display</th><th title="Chance of each final count, 0 to 6">Odds 0–6</th>
+          <th title="Expected end-of-game value of one gem">EV/gem</th><th title="Value at today's display">Now</th><th title="Your EV minus the public view's: where your hand tells you something the table doesn't">Edge</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>
+    </details>`;
 }
 
 function appendLog(r, view) {
@@ -729,10 +887,95 @@ function renderEnd() {
       <td class="total">${r.total}</td></tr>`;
   }).join("");
   renderMarket($("end-market"), view.state, null, { final: true });
+  try {
+    renderAnalysis();
+  } catch (err) {
+    console.error("Game analysis failed:", err);
+    $("end-analysis").innerHTML = `<p class="empty">Analysis unavailable: ${esc(err.message)}</p>`;
+  }
   hideToast();
   showScreen("end");
   $("end-rematch").onclick = () => startGame({ ...config });
   $("end-again").onclick = () => startGame({ ...config, seed: null });
+}
+
+// Game analysis ------------------------------------------------------------
+
+const ROUND_VERDICTS = {
+  overpaid: ["Overpaid", "neg"], unlucky: ["Unlucky", "warn"], overbid: ["Overbid", "warn"], good: ["Good", "pos"],
+  "loan-cost": ["Loan cost", "neg"], missed: ["Missed", "info"], "missed-invest": ["Missed", "info"],
+};
+
+function renderAnalysis() {
+  const { view } = game;
+  const res = analyze(view, game.log, game.snapshots);
+  const me = view.human_idx;
+  const s = res.summary;
+  const parts = [];
+
+  if (s) {
+    const lead = s.leader.idx === me ? "the best at the table" : `${esc(s.leader.name)} led with ${signed(s.leader.surplus)}`;
+    parts.push(`<p class="an-identity">Your score = <b>${res.start}</b> starting coins <b class="${signCls(s.you.surplus)}">${signed(s.you.surplus)}</b> surplus = <b>${s.you.score}</b>.
+      You ranked #${s.surplusRank} on surplus, ${lead}.</p>`);
+  } else {
+    parts.push(`<p class="an-identity">Every score = <b>${res.start}</b> starting coins + the surplus from the lots that player won.</p>`);
+  }
+  parts.push(`<p class="muted small">Surplus is what a lot was worth to its winner minus the price. A treasure is worth its gems at the final display
+    plus any missions it completed, an invest is worth its bid plus the bonus, and a loan is worth nothing (you repay what you borrowed).</p>`);
+
+  const order = res.players.map((p, i) => ({ ...p, i })).sort((a, b) => b.surplus - a.surplus);
+  const off = res.players.filter((p) => p.score !== null && p.predictedScore !== p.score);
+  parts.push(`<div class="score-table-wrap"><table class="score-table an-players">
+      <thead><tr><th>Player</th><th>Lots won</th><th>Paid</th><th>Treasure</th><th>Loans</th><th>Invest</th><th>Surplus</th><th title="Treasure lots won for more than they turned out to be worth">Overpays</th></tr></thead>
+      <tbody>${order.map((p) => `<tr class="${p.i === me ? "me" : ""}">
+        <td><b>${esc(p.name)}</b> ${p.i === me ? "" : `<span class="chip kind">${esc(seatLabel(view, p.i))}</span>`}</td>
+        <td>${p.lotsWon}</td><td>${p.paid}</td>
+        <td class="${signCls(p.treasureSurplus)}">${signed(p.treasureSurplus)}</td>
+        <td class="${signCls(p.loanSurplus)}">${signed(p.loanSurplus)}</td>
+        <td class="${signCls(p.investSurplus)}">${signed(p.investSurplus)}</td>
+        <td class="total ${signCls(p.surplus)}">${signed(p.surplus)}</td>
+        <td>${p.overpays}</td></tr>`).join("")}</tbody></table></div>`);
+  if (off.length) parts.push(`<p class="neg small">Ledger mismatch for ${off.map((p) => esc(p.name)).join(", ")}: the surplus doesn't add up to the final score.</p>`);
+
+  if (s) {
+    const card = (title, rows, chip, empty, text = (r) => r.note) => `<div class="an-card"><h4>${title}</h4>${rows.length
+      ? `<ol>${rows.map((r) => `<li>${chip(r)}<span>${esc(text(r))}</span></li>`).join("")}</ol>`
+      : `<p class="empty">${empty}</p>`}</div>`;
+    const bought = (r) => `R${r.round} ${auctionText(r.auction)}: paid ${r.price} for ${r.auction.kind === "invest" ? `+${r.auction.amount} back` : `a lot worth ${r.gross}`}.`;
+    const acc = s.estimateMae === null
+      ? '<p class="empty">No treasure lots to compare.</p>'
+      : `<p>Over ${s.estimateCount} treasure lots, the fair value from your seat missed what the lot turned out to be worth to you by
+          <b>${s.estimateMae.toFixed(1)}</b> coins on average, and ran <b class="${s.estimateBias > 0.5 ? "warn" : s.estimateBias < -0.5 ? "info" : ""}">${Math.abs(s.estimateBias).toFixed(1)} ${s.estimateBias >= 0 ? "high" : "low"}</b>.</p>
+         <p class="muted small">That's the luck in the hidden hands: the fair value is an exact expectation, so the miss is what nobody could see at bid time.</p>`;
+    parts.push(`<div class="an-grid">
+        ${card("Your biggest leaks", s.leaks, (r) => `<span class="chip neg">−${r.loss}</span>`, "No leaks: nothing overpaid or overbid.")}
+        ${card("Missed bargains", s.missed, (r) => `<span class="chip info">+${r.gain}</span>`, "No lot you could afford went cheap.")}
+        ${card("Best buys", s.best, (r) => `<span class="chip pos">+${r.surplus}</span>`, "No profitable lots won.", bought)}
+        <div class="an-card"><h4>Estimate accuracy</h4>${acc}</div>
+      </div>`);
+  }
+
+  const head = me === null
+    ? "<th>Rd</th><th>Lot</th><th>Winner</th><th>Price</th><th>Worth</th><th>Surplus</th><th title=\"The winner's fair value from its own seat at bid time\">Winner's fair</th>"
+    : "<th>Rd</th><th>Lot</th><th>Winner</th><th>Price</th><th>Worth</th><th>Surplus</th><th>Your bid</th><th title=\"Fair value from your seat at bid time\">Your fair</th><th>Verdict</th>";
+  const rows = res.rounds.map((r) => {
+    const fair = r.auction.kind === "treasure" ? (me === null ? r.fair[r.winner] : r.myFair) : null;
+    const v = r.verdict ? ROUND_VERDICTS[r.verdict] : null;
+    return `<tr class="${r.winner === me ? "me" : ""}" title="${esc(r.note || "")}">
+      <td>${r.round}</td>
+      <td class="lot">${auctionText(r.auction)} ${r.taken.length ? `<span class="gem-row">${gemList(r.taken, "sm")}</span>` : ""}</td>
+      <td>${esc(view.state.players[r.winner].name)}</td>
+      <td>${r.price}</td><td>${r.gross}</td>
+      <td class="${signCls(r.surplus)}">${signed(r.surplus)}</td>
+      ${me === null ? `<td>${num1(fair)}</td>` : `<td>${r.myBid}</td><td>${num1(fair)}</td><td>${v ? `<span class="chip ${v[1]}">${v[0]}</span>` : ""}</td>`}
+    </tr>`;
+  }).join("");
+  parts.push(`<details class="an-rounds"><summary>Round by round</summary>
+      <div class="score-table-wrap"><table class="score-table an-round-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>
+      ${me === null ? "" : '<p class="muted small">Hover or tap a row for the details behind its verdict.</p>'}
+    </details>`);
+
+  $("end-analysis").innerHTML = parts.join("");
 }
 
 // --------------------------------------------------------------------------
@@ -749,6 +992,7 @@ $("end-setup").onclick = () => { game = null; showScreen("setup"); };
 $("sp-step").onclick = () => { stopAuto(); act("step"); };
 $("sp-auto").onclick = toggleAuto;
 $("sp-speed").onchange = () => { if (game?.auto && !game.busy) scheduleAuto(); };
+$("g-coach-btn").onclick = toggleCoach;
 
 document.addEventListener("keydown", (e) => {
   if (!game || $("screen-game").hidden || e.target.matches("input, select, textarea")) return;
